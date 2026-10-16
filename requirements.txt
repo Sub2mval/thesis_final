@@ -1,0 +1,13 @@
+langgraph
+langgraph-checkpoint-sqlite
+langchain
+langchain-ollama
+langchain-tavily
+langchain-experimental
+"markitdown[all]"
+python-dotenv
+huggingface_hub
+ollama
+pandas
+scipy
+pyarrow        # only if the GAIA metadata is read as parquet
