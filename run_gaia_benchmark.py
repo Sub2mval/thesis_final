@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run GAIA validation tasks through LLM-debate (local Ollama models) with / without the trust allocator,
-and inject an FM-2.x error into one public message.
+and inject an FM-2.x error into message 1 (Agent 1's first answer), identically for every condition.
 
     python run_gaia_benchmark.py --n-questions 5 --agent-models gemma4:31b --trust-model qwen3.8:27b
     python run_gaia_benchmark.py --task-ids <id> --agent-models gemma4:31b gemma4:12b qwen3.5:9b --trust-model muse-glimmer:30b
@@ -8,8 +8,9 @@ and inject an FM-2.x error into one public message.
 Per task this gives the 4 conditions of the experiment (slide 6):
     <output-dir>/<task_id>/baseline_off.{json,md,full.md}   1  clean run, no trust allocator
     <output-dir>/<task_id>/baseline_on.{json,md,full.md}    2  clean run, with trust allocator
-    <output-dir>/<task_id>/fork_off.{json,md,full.md}       3  same clean run forked at one message: injected error, no allocator
+    <output-dir>/<task_id>/fork_off.{json,md,full.md}       3  same start, but message 1 replaced by its corrupted copy, no allocator
     <output-dir>/<task_id>/fork_on.{json,md,full.md}        4  same as 3, with allocator
+Message 1 and its corruption are generated once per task and shared by all four conditions.
 .md = concise public trace; .full.md = + every model call (inputs, reasoning, outputs). Then run: python analyze.py <results>
 
 Setup: .env next to this script with TAVILY_API_KEY (web search) and, for the ONE-TIME GAIA download only, HF_TOKEN.
@@ -51,8 +52,8 @@ def now_iso() -> str:
 
 
 # --------------------------------------------------------------------------------------------------
-# Trace data collection: every LLM call (tokens, timing, input, reasoning, output), split into the
-# clean phase ("baseline") and the phase after the fork ("fork", includes the injector call).
+# Trace data collection: every LLM call (tokens, timing, input, reasoning, output), split into phases:
+# "shared" (message 1 + the injector, once per task), then "clean_<on|off>" and "fork_<on|off>" per allocator setting.
 # --------------------------------------------------------------------------------------------------
 def msg_dict(m: Any) -> dict:
     """LangChain message / dict -> plain dict (images dropped, reasoning and tool calls kept)."""
@@ -80,11 +81,11 @@ class Recorder:
 
     def reset(self) -> None:
         self.calls: list[dict] = []
-        self.phase = "baseline"
-        self.started_baseline, self.started_fork = now_iso(), None
+        self.phase, self.started = "shared", {}
+        self.begin("shared")
 
-    def begin_fork(self) -> None:
-        self.phase, self.started_fork = "fork", now_iso()
+    def begin(self, phase: str) -> None:
+        self.phase, self.started[phase] = phase, now_iso()
 
     def add(self, **kw: Any) -> None:
         with self.lock:
@@ -130,9 +131,12 @@ def install_recorder(rec: Recorder, retries: int = 2) -> None:
         m = res.generations[0].message
         out = msg_dict(m)
         um = getattr(m, "usage_metadata", None) or {}
+        done = (getattr(m, "response_metadata", None) or {}).get("done_reason")  # "length" = cut off (context window full)
+        if done == "length":
+            log(f"      !! {model} was cut off at the context limit (done_reason=length); consider a larger --num-ctx")
         rec.add(call_type=kind, provider="ollama", model=model, elapsed_seconds=time.time() - t0,
                 prompt_tokens=um.get("input_tokens"), completion_tokens=um.get("output_tokens"), status="ok", error=None,
-                input=inp, output=out, reasoning=out.get("reasoning"))
+                input=inp, output=out, reasoning=out.get("reasoning"), done_reason=done)
         return res
 
     ChatOllama._generate = _generate
@@ -161,7 +165,7 @@ def trust_history(state: dict) -> list[dict]:
 
 
 def build_record(*, task: dict, trust: bool, state: dict, condition: str, thread_id: str, stats: dict, started: str,
-                 finished: str, args: argparse.Namespace, injection: Optional[dict] = None, error: Optional[str] = None) -> dict:
+                 args: argparse.Namespace, injection: Optional[dict] = None, error: Optional[str] = None) -> dict:
     final = state.get("final")
     extracted = extract_answer(final)
     return {
@@ -172,17 +176,14 @@ def build_record(*, task: dict, trust: bool, state: dict, condition: str, thread
         "final_answer_raw": final, "final_answer_extracted": extracted,
         "correct": gaia_score(extracted, task["Final answer"]) if final is not None else False,
         "messages": public_messages(state, task["Final answer"]), "trust_history": trust_history(state),
-        "injection": injection, "error": error, "token_stats": stats, "started_at": started, "finished_at": finished,
+        "injection": injection, "error": error, "token_stats": stats, "started_at": started, "finished_at": now_iso(),
         "contexts": {f"Agent{a}": [msg_dict(m) for m in ms] for a, ms in (state.get("hist") or {}).items()},
     }
 
 
-def injection_record(res: dict) -> dict:
-    keys = ("eligible", "requested_n", "n", "attempts", "fm_id", "fm_name", "reason", "original", "corrupted", "prompt", "injector_response")
-    inj = {k: res.get(k) for k in keys}
-    inj["log_index"] = res["n"] - 1 if res["eligible"] else None  # one public message per agent turn
-    inj["target"] = f"Agent{res['agent']} (round {res['round']})" if res["eligible"] else None
-    return inj
+def injection_record(inj: dict) -> dict:
+    """The shared injection without the (non-serialisable) corrupted agent context."""
+    return {k: v for k, v in inj.items() if k != "first"}
 
 
 # --------------------------------------------------------------------------------------------------
@@ -192,8 +193,8 @@ def _fence(text: Any) -> str:
     return f"````\n{text if text is not None else '(none)'}\n````"
 
 
-def render_md(title: str, r: dict, full: bool = False, base: Optional[dict] = None) -> str:
-    """Public report; full=True adds every model call (for a fork: the clean calls first, then the resumed ones)."""
+def render_md(title: str, r: dict, full: bool = False, prior: tuple = ()) -> str:
+    """Public report; full=True adds every model call (`prior` = [(heading, calls)] of earlier phases, e.g. the shared ones)."""
     inj = r.get("injection") or {}
     o = [f"# {title}" + (" - full trace" if full else ""), "",
          f"**Task ID:** `{r['task_id']}`", f"**Condition:** `{r['condition']}`",
@@ -204,21 +205,14 @@ def render_md(title: str, r: dict, full: bool = False, base: Optional[dict] = No
     if r.get("attached_file"):
         o += ["", f"**Attachment:** `{r['attached_file']}`"]
     if inj:
-        o += ["", "### Fork / divergence", "", f"- Eligibility: **{'ELIGIBLE' if inj['eligible'] else 'INELIGIBLE'}**",
-              f"- Requested public message: `{inj['requested_n']}`, injected message: `{inj['n']}`"]
-        if inj["eligible"]:
-            o += [f"- Target: {inj['target']}", f"- Failure mode chosen by the injector: `{inj['fm_id']}` - {inj['fm_name']}",
-                  f"- Injector's reason: {inj['reason'] or '(none)'}"]
-            if inj["n"] != inj["requested_n"]:
-                o += ["- The requested message was ineligible, so injection advanced to the next one."]
-        else:
-            o += ["- No corrupted message was inserted; the clean run is the only execution trace."]
+        o += ["", "### Injected error (message 1, identical in all injected conditions of this task)", "",
+              f"- Eligibility: **{'ELIGIBLE' if inj['eligible'] else 'INELIGIBLE'}**"]
+        o += [f"- Failure mode chosen by the injector: `{inj['fm_id']}` - {inj['fm_name']}", f"- Injector's reason: {inj['reason'] or '(none)'}"] \
+            if inj["eligible"] else ["- No corrupted message was inserted; this record repeats the clean run."]
     trust = {t["message_index"]: t for t in r["trust_history"]}
     o += ["", "---", "", "## Public flow", ""]
     for m in r["messages"]:
-        mark = " - **CORRUPTED / fork point**" if inj.get("log_index") == m["log_index"] else ""
-        if mark:
-            o += ["", "## Fork begins here", "", "Everything above is the clean pre-fork execution; this is the first changed output.", ""]
+        mark = " - **CORRUPTED (shared injection)**" if inj.get("log_index") == m["log_index"] else ""
         o += [f"### [{m['log_index'] + 1}] {m['source']} - round {m['round']}{mark}", "", _fence(m["content"]), "",
               f"**Step accuracy:** {'correct' if m['step_correct'] else 'incorrect'} (answer: `{m['answer']}`)", ""]
         if m["log_index"] in trust:
@@ -226,8 +220,7 @@ def render_md(title: str, r: dict, full: bool = False, base: Optional[dict] = No
             o += [f"**Trust allocator output -> score {t['trust_score']}/5**", "", t["reason"], ""]
     if full:
         o += ["---", "", "## Model-call trace", ""]
-        phases = [("PRE-FORK / CLEAN", base["token_stats"]["calls"]), ("FORK / RESUMED", r["token_stats"]["calls"])] if base \
-            else [("RUN", r["token_stats"]["calls"])]
+        phases = [*prior, ("THIS RUN", r["token_stats"]["calls"])]
         titles = {"agent_call": "Agent / model call", "trust_audit": "Trust allocator", "corruption": "Error injector"}
         for name, calls in phases:
             o += [f"## {name}", ""] if calls else []
@@ -246,11 +239,11 @@ def render_md(title: str, r: dict, full: bool = False, base: Optional[dict] = No
     return "\n".join(o) + "\n"
 
 
-def write_outputs(task_dir: Path, name: str, rec: dict, base: Optional[dict] = None) -> None:
+def write_outputs(task_dir: Path, name: str, rec: dict, prior: tuple = ()) -> None:
     task_dir.mkdir(parents=True, exist_ok=True)
     (task_dir / f"{name}.json").write_text(json.dumps(rec, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
     (task_dir / f"{name}.md").write_text(render_md(name, rec), encoding="utf-8")
-    (task_dir / f"{name}.full.md").write_text(render_md(name, rec, full=True, base=base), encoding="utf-8")
+    (task_dir / f"{name}.full.md").write_text(render_md(name, rec, full=True, prior=prior), encoding="utf-8")
 
 
 def summary_row(r: dict) -> dict:
@@ -261,47 +254,58 @@ def summary_row(r: dict) -> dict:
 
 
 # --------------------------------------------------------------------------------------------------
-# One (task, trust setting): clean baseline run + injected fork
+# One task: message 1 and its corruption are made ONCE; every condition then starts from them
 # --------------------------------------------------------------------------------------------------
-def run_condition(task: dict, trust: bool, args: argparse.Namespace, rec: Recorder, out_dir: Path, work_dir: Path) -> list[dict]:
-    from debate import build_graph, run_debate
-    from error_injection import inject_error
+def run_task(task: dict, args: argparse.Namespace, rec: Recorder, out_dir: Path, work_dir: Path) -> list[dict]:
+    from debate import build_graph, first_answer, run_debate
+    from error_injection import make_injection
 
-    on = "on" if trust else "off"
+    settings = {"off": [False], "on": [True], "both": [False, True]}[args.trust]
     task_dir = out_dir / task["task_id"]
-    if args.skip_existing and all((task_dir / f"{c}_{on}.json").exists() for c in ("baseline", "fork")):
-        log(f"  skip trust={on}: outputs already exist")
+    todo = [t for t in settings if not (args.skip_existing and all((task_dir / f"{c}_{'on' if t else 'off'}.json").exists() for c in ("baseline", "fork")))]
+    if not todo:
+        log("  skip: outputs already exist")
         return []
+    models = dict(zip("123", args.agent_models))
+    common = dict(task=task, args=args)
     rec.reset()
-    thread_id = f"{task['task_id']}::{'trust' if trust else 'plain'}::{uuid.uuid4().hex[:8]}"
-    graph = build_graph(dict(zip("123", args.agent_models)), args.trust_model if trust else None, str(work_dir / "gaia.db"))
-    base_state = res = err = None
-    try:
-        cfg, base_state = run_debate(graph, task["Question"], task["file"], args.n_rounds, thread_id)
-        rec.begin_fork()
-        res = inject_error(graph, cfg, args.injector_model, args.message_index)
-    except Exception as e:  # keep whatever finished (e.g. the clean run) and report the failure
-        err = f"{type(e).__name__}: {e}"
-        log(f"  ERROR trust={on}: {err}")
+    rows: list[dict] = []
+    try:  # --- shared part: Agent 1's first answer + the one corruption of it
+        first = first_answer(models["1"], task["Question"], task["file"])
+        inj = make_injection(task["Question"], task["file"], first, args.injector_model)
+    except Exception as e:
+        log(f"  ERROR (shared part): {type(e).__name__}: {e}")
         traceback.print_exc()
-    common = dict(task=task, trust=trust, thread_id=thread_id, args=args)
-    if base_state is None:  # the clean run itself failed: nothing to save but the error
-        r = build_record(state={}, condition=f"baseline_{on}", stats=rec.stats("baseline"), started=rec.started_baseline,
-                         finished=now_iso(), error=err, **common)
-        write_outputs(task_dir, f"baseline_{on}", r)
+        r = build_record(state={}, condition="baseline_" + ("on" if todo[0] else "off"), trust=todo[0], thread_id="-", stats=rec.stats("shared"),
+                         started=rec.started["shared"], error=f"{type(e).__name__}: {e}", **common)
+        write_outputs(task_dir, r["condition"], r)
         return [summary_row(r)]
-    fork_start = rec.started_fork or now_iso()
-    base = build_record(state=base_state, condition=f"baseline_{on}", stats=rec.stats("baseline"),
-                        started=rec.started_baseline, finished=fork_start, **common)
-    write_outputs(task_dir, f"baseline_{on}", base)
-    log(f"  trust={on:3s} clean: answer={base['final_answer_extracted']!r} correct={base['correct']}")
-    # ineligible (or failed) injection -> the fork record falls back to the clean state, flagged via injection.eligible
-    fork = build_record(state=(res or {}).get("final_state") or base_state, condition=f"fork_{on}", stats=rec.stats("fork"),
-                        started=fork_start, finished=now_iso(), injection=injection_record(res) if res else None, error=err, **common)
-    write_outputs(task_dir, f"fork_{on}", fork, base=base)
-    log(f"  trust={on:3s} fork : answer={fork['final_answer_extracted']!r} correct={fork['correct']} "
-        f"fm={(fork['injection'] or {}).get('fm_id')}" + (f" ERROR={err}" if err else ""))
-    return [summary_row(base), summary_row(fork)]
+    shared = [("SHARED: message 1 + error injection (identical in all 4 conditions)", rec.stats("shared")["calls"])]
+    log(f"  shared: message 1 made; injection {inj['fm_id'] if inj['eligible'] else 'INELIGIBLE (no injected runs)'}")
+    for trust in todo:
+        on = "on" if trust else "off"
+        graph = build_graph(models, args.trust_model if trust else None, str(work_dir / "gaia.db"))
+        thread = f"{task['task_id']}::{on}::{uuid.uuid4().hex[:8]}"
+        recs = {}
+        for kind, start in (("baseline", first), ("fork", inj["first"])):
+            phase, err, state = f"{'clean' if kind == 'baseline' else 'fork'}_{on}", None, {}
+            rec.begin(phase)
+            if start is None:  # ineligible injection: the fork record repeats the clean run (flagged by injection.eligible)
+                state = recs["baseline"]["_state"]
+            else:
+                try:
+                    _, state = run_debate(graph, task["Question"], task["file"], args.n_rounds, f"{thread}::{kind}", first=start)
+                except Exception as e:  # keep what finished and report the failure
+                    err = f"{type(e).__name__}: {e}"
+                    log(f"  ERROR {kind} trust={on}: {err}")
+                    traceback.print_exc()
+            r = build_record(state=state, condition=f"{kind}_{on}", trust=trust, thread_id=f"{thread}::{kind}", stats=rec.stats(phase),
+                             started=rec.started[phase], injection=injection_record(inj) if kind == "fork" else None, error=err, **common)
+            write_outputs(task_dir, f"{kind}_{on}", r, prior=shared + ([("CLEAN RUN", recs["baseline"]["token_stats"]["calls"])] if kind == "fork" else []))
+            recs[kind] = {**r, "_state": state}
+            rows.append(summary_row(r))
+            log(f"  trust={on:3s} {kind:8s}: answer={r['final_answer_extracted']!r} correct={r['correct']}" + (f" ERROR={err}" if err else ""))
+    return rows
 
 
 # --------------------------------------------------------------------------------------------------
@@ -317,8 +321,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--injector-model", choices=AGENT_MODELS, default="gemma4:31b", help="error injector model")
     p.add_argument("--trust", choices=("off", "on", "both"), default="both", help="trust allocator setting(s) to run")
     p.add_argument("--n-rounds", type=int, default=2, help="debate rounds (default 2)")
-    p.add_argument("--message-index", type=int, default=1, metavar="N",
-                   help="public message to corrupt, 1-based (default 1 = Agent 1's first answer, the first one the allocator rates)")
     p.add_argument("--num-ctx", type=int, default=32768, help="Ollama context window in tokens (default 32768)")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--no-think", action="store_true", help="disable thinking mode (it is skipped automatically for models without it)")
@@ -387,8 +389,7 @@ def main() -> int:
     rows: list[dict] = []
     for ti, tid in enumerate(ids, 1):
         log(f"=== Task {ti}/{len(ids)}: {tid} (level {tasks[tid]['Level']}) ===")
-        for trust in {"off": [False], "on": [True], "both": [False, True]}[args.trust]:
-            rows += run_condition(tasks[tid], trust, args, rec, out_dir, work_dir)
+        rows += run_task(tasks[tid], args, rec, out_dir, work_dir)
     if rows:
         csv_path, new = out_dir / "summary.csv", not (out_dir / "summary.csv").exists()
         with open(csv_path, "a", newline="", encoding="utf-8") as f:

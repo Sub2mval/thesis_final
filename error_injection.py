@@ -1,9 +1,8 @@
-"""Checkpointer-based error injection for the debate graph (debate.py), FM-2.x only.
+"""One shared error injection for the debate graph (debate.py), FM-2.x only.
 
-Run a debate to completion under a checkpointer, then fork the thread at the n-th public answer, replace it with
-ONE corrupted version, and resume to the end. The injector LLM sees all six inter-agent-misalignment failure modes
-and picks the one that fits the target message best in context (or declares it INELIGIBLE, in which case the next
-public message is tried). Works with any graph whose state has: question, file, log, hist, round (nodes a1/a2/a3).
+Message 1 (Agent 1's first answer) is corrupted once per task. The injector LLM sees all six inter-agent-misalignment
+failure modes and picks the one that fits the message best in context (or declares it INELIGIBLE, in which case the
+task has no injected runs). Every injected condition then starts from that same corrupted message (debate.run_debate).
 """
 
 from __future__ import annotations
@@ -140,52 +139,21 @@ def parse_injector_response(response: str) -> tuple[Optional[dict], str, str]:
     return (mode, reason, rest) if rest else (None, "", text)
 
 
-def corrupt(question: str, file: Optional[str], log: list, n: int, model: str) -> Dict[str, Any]:
-    """One context-chosen corruption of the n-th public answer (log[n-1]), or an INELIGIBLE result."""
-    from debate import image_blocks  # lazy: debate imports agents, not this module, but keep imports light
+def make_injection(question: str, file: Optional[str], first: dict, model: str) -> Dict[str, Any]:
+    """Corrupt message 1 (Agent 1's first answer) ONCE per task, with the failure mode the injector LLM picks from
+    the context. The result is shared by every injected run of the task (with and without the trust allocator), because
+    message 1 depends only on the question. -> {eligible, fm_id, fm_name, reason, original, corrupted, prompt,
+    injector_response, first (the corrupted `first_answer`, ready for run_debate; None if ineligible)}."""
+    from debate import image_blocks, task_text  # lazy import: debate does not import this module
 
-    target = log[n - 1]
-    who = lambda e: f"Agent {e['agent']} (round {e['round']})"
-    conversation = "\n".join(f"[{who(e)}]: {e['text']}" for e in log[: n - 1]) or "(no prior agent outputs)"
-    prompt = _CORRUPTION_PROMPT.format(menu=_MENU, task=question, target_agent=who(target),
-                                       conversation=conversation, original_content=target["text"])
-    content = [{"type": "text", "text": prompt}] + image_blocks(file)  # images reach the injector too
-    response = make_llm(model, "corruption").invoke([{"role": "user", "content": content}]).content.strip()
+    prompt = _CORRUPTION_PROMPT.format(menu=_MENU, task=task_text(question, file), target_agent="Agent 1 (round 1)",
+                                       conversation="(no prior agent outputs)", original_content=first["text"])
+    response = make_llm(model, "corruption").invoke([{"role": "user", "content": [{"type": "text", "text": prompt}] + image_blocks(file)}]).content.strip()
     mode, reason, text = parse_injector_response(response)
-    return {"eligible": mode is not None, "content": text, "fm_id": mode and mode["id"],
-            "fm_name": mode and mode["name"], "reason": reason, "prompt": prompt, "response": response}
-
-
-def inject_error(graph, cfg: Dict[str, Any], model: str, n: int = 1) -> Dict[str, Any]:
-    """Fork at the n-th public answer; ineligible targets are skipped (next message is tried)."""
-    baseline = graph.get_state(cfg).values
-    history = list(graph.get_state_history(cfg))[::-1]  # oldest -> newest
-    total, requested, attempts = len(baseline.get("log", [])), n, []
-    if n > total:
-        raise ValueError(f"The thread has fewer than {n} public answers.")
-
-    while n <= total:
-        after = next(s for s in history if len(s.values.get("log", [])) >= n)  # checkpoint right after answer n
-        vals = after.values
-        entry = vals["log"][n - 1]
-        c = corrupt(vals["question"], vals.get("file"), vals["log"], n, model)
-        attempts.append({"n": n, "eligible": c["eligible"], "injector_response": c["response"]})
-        if not c["eligible"]:
-            n += 1
-            continue
-
-        hist = dict(vals["hist"])  # the agent's private context must contain the corrupted answer too
-        hist[entry["agent"]] = hist[entry["agent"]][:-1] + [hist[entry["agent"]][-1].model_copy(update={"content": c["content"]})]
-        before = graph.get_state(after.parent_config)  # state just before the agent produced answer n
-        fork = graph.update_state(before.config, {"hist": hist, "log": [{**entry, "text": c["content"]}], "round": vals["round"]},
-                                  as_node=f"a{entry['agent']}")
-        return {"eligible": True, "requested_n": requested, "n": n, "attempts": attempts,
-                "agent": entry["agent"], "round": entry["round"], "fm_id": c["fm_id"], "fm_name": c["fm_name"],
-                "reason": c["reason"], "original": entry["text"], "corrupted": c["content"], "prompt": c["prompt"],
-                "injector_response": c["response"], "baseline_final": baseline.get("final"),
-                "final_state": graph.invoke(None, {**fork, "recursion_limit": 100})}
-
-    return {"eligible": False, "requested_n": requested, "n": n - 1, "attempts": attempts, "fm_id": None,
-            "fm_name": None, "reason": "", "original": None, "corrupted": None, "prompt": None,
-            "injector_response": attempts[-1]["injector_response"], "baseline_final": baseline.get("final"),
-            "final_state": None}
+    bad = None
+    if mode:  # the agent's private context must hold the corrupted answer too, not the original
+        h = first["hist"]
+        bad = {"text": text, "hist": h[:-1] + [h[-1].model_copy(update={"content": text})]}
+    return {"eligible": mode is not None, "fm_id": mode and mode["id"], "fm_name": mode and mode["name"], "reason": reason,
+            "original": first["text"], "corrupted": text if mode else None, "prompt": prompt, "injector_response": response,
+            "log_index": 0 if mode else None, "target": "Agent1 (round 1)" if mode else None, "first": bad}

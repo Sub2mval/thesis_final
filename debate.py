@@ -3,6 +3,10 @@
   without trust allocator:  a1 -> a2 -> a3 -> (a1 | agg) -> END
   with trust allocator:     a1 -> trust -> a2 -> trust -> a3 -> trust -> (a1 | agg) -> END
 
+Agent 1's first answer (message 1) is generated ONCE per task (first_answer) and every condition starts from it
+(run_debate(first=...)): clean runs from the original, injected runs from one shared corrupted copy
+(error_injection.make_injection). So the injection is identical with and without the allocator.
+
 The allocator scores every answer right after it is produced (it sees the task, the public answers and the
 attachment, never any reasoning). The next agent sees ONLY the trust score (1-5) and the reasons for the single
 answer that reaches it; there is no trust label. Verdicts are kept in state["trust"], apart from the public log.
@@ -37,8 +41,18 @@ class State(TypedDict, total=False):
     final: str
 
 
+FORCE_ANSWER = ("You ran out of room or steps before giving an answer. Using only what you have already found, give your best "
+                "concise answer now, ending with `FINAL ANSWER: ...`. Do not call tools.")
+
+
 def run_agent(model: str, messages: list) -> list:
-    return make_agent(model).invoke({"messages": messages}, {"recursion_limit": 40})["messages"]  # <= ~20 tool steps
+    """Run the tool-using agent. If it ends without a `FINAL ANSWER:` (generation cut off, step limit, format slip),
+    ask once more for a best-effort answer, so a message is never empty because of infrastructure limits."""
+    run = lambda m: make_agent(model).invoke({"messages": m}, {"recursion_limit": 40})["messages"]  # <= ~20 tool steps
+    out = run(messages)
+    if "FINAL ANSWER:" not in (out[-1].content or ""):
+        out = run(out + [{"role": "user", "content": FORCE_ANSWER}])
+    return out
 
 
 def keep_thoughts(msgs):
@@ -67,6 +81,21 @@ ANSWER_INSTRUCTION = (
     "\n\nGive a concise but auditable answer: include the key reasoning and evidence used, "
     "then end with `FINAL ANSWER: ...`. Never reply with only the final-answer line."
 )
+
+
+def task_text(question: str, file: str | None) -> str:
+    return question + (f"\n\nAttached file: {file}" if file else "")
+
+
+def user_turn(task: str, file: str | None, first: bool) -> dict:
+    """The user message an agent receives (the attachment image goes in only with an agent's first message)."""
+    return {"role": "user", "content": [{"type": "text", "text": task + ANSWER_INSTRUCTION}] + (image_blocks(file) if first else [])}
+
+
+def first_answer(model: str, question: str, file: str | None) -> dict:
+    """Agent 1's round-1 answer: {"text": public answer, "hist": its private context}. Generated once per task."""
+    out = run_agent(model, [user_turn(task_text(question, file), file, True)])
+    return {"text": out[-1].content or "(no answer produced)", "hist": keep_thoughts(out)}
 
 
 # ---------------------------------------------------------------------------------------------- trust allocator
@@ -132,8 +161,7 @@ def build_graph(models: dict[str, str], trust_model: str | None, db: str):
                     "Criticize and verify the work above: re-check facts and calculations with your tools, "
                     "point out errors, and propose improvements or alterations where needed. "
                     "Then give your own best answer.")
-            content = [{"type": "text", "text": task + ANSWER_INSTRUCTION}] + ([] if msgs else image_blocks(s.get("file")))
-            out = run_agent(models[i], msgs + [{"role": "user", "content": content}])
+            out = run_agent(models[i], msgs + [user_turn(task, s.get("file"), not msgs)])
             update = {"hist": {**hist, i: keep_thoughts(out)},
                       "log": [{"round": rnd, "agent": i, "text": out[-1].content or "(no answer produced)"}]}
             if i == "3":
@@ -175,10 +203,16 @@ def build_graph(models: dict[str, str], trust_model: str | None, db: str):
     return g.compile(checkpointer=SqliteSaver(sqlite3.connect(db, check_same_thread=False)))
 
 
-def run_debate(graph, question: str, file: str | None, n_rounds: int = 2, thread_id: str | None = None):
-    """Run (or resume, if the thread already has checkpoints) a debate -> (config, final state values)."""
+def run_debate(graph, question: str, file: str | None, n_rounds: int = 2, thread_id: str | None = None, first: dict | None = None):
+    """Run (or resume, if the thread already has checkpoints) a debate -> (config, final state values).
+    first = a first_answer() result: the debate then starts right after message 1 instead of generating it."""
     cfg = {"configurable": {"thread_id": thread_id or uuid.uuid4().hex}, "recursion_limit": 6 * n_rounds + 5}
-    new = {"question": question + (f"\n\nAttached file: {file}" if file else ""),
-           "file": file, "n_rounds": n_rounds, "round": 1}
-    graph.invoke(None if graph.get_state(cfg).values else new, cfg)
+    new = {"question": task_text(question, file), "file": file, "n_rounds": n_rounds, "round": 1}
+    if not graph.get_state(cfg).values:
+        if first:  # pretend agent 1 just produced `first`; the graph carries on from there (audit, then agent 2)
+            graph.update_state(cfg, {**new, "hist": {"1": first["hist"]}, "log": [{"round": 1, "agent": "1", "text": first["text"]}]}, as_node="a1")
+            new = None
+        graph.invoke(new, cfg)
+    else:
+        graph.invoke(None, cfg)
     return cfg, graph.get_state(cfg).values

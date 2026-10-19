@@ -46,12 +46,13 @@ def load(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             while k + prop < len(ok) and not ok[k + prop]:
                 prop += 1
         runs.append({"config": cfg, "task_id": r["task_id"], "kind": kind, "trust": trust, "final_correct": bool(r["correct"]),
-                     "step_acc": float(np.mean(ok)) if ok else np.nan, "n_steps": len(ok), "eligible": k is not None,
+                     "step_acc": float(np.mean(ok)) if ok else np.nan, "n_steps": len(ok),
+                     "n_no_answer": sum("FINAL ANSWER:" not in m["content"] for m in r["messages"]), "eligible": k is not None,
                      "fm_id": inj.get("fm_id"), "inj_step": k, "inj_step_correct": ok[k] if k is not None else None,
                      "trust_at_inj": trust_at.get(k) if k is not None else None,
                      "propagation": prop, "censored": bool(prop and k + prop == len(ok)), "error": r.get("error")})
         steps += [{"config": cfg, "task_id": r["task_id"], "kind": kind, "trust": trust, "step": m["log_index"], "agent": m["source"],
-                   "round": m["round"], "step_correct": bool(m["step_correct"]), "trust_score": trust_at.get(m["log_index"]),
+                   "round": m["round"], "step_correct": bool(m["step_correct"]), "has_answer": "FINAL ANSWER:" in m["content"], "trust_score": trust_at.get(m["log_index"]),
                    "injected": m["log_index"] == k} for m in r["messages"]]
     runs, steps = pd.DataFrame(runs), pd.DataFrame(steps)
     if not runs.empty:  # was the ORIGINAL message (clean run, same task and allocator setting) at the injected step correct?
@@ -123,7 +124,8 @@ def analyse(cfg: str, runs: pd.DataFrame, steps: pd.DataFrame, high: float, low:
                      "mean step accuracy": f"{d.step_acc.mean():.2f}" if len(d) else "n/a",
                      "mean trust score": f"{st.trust_score.mean():.2f}" if st.trust_score.notna().any() else "-",
                      "mean error propagation (steps)": f"{d.propagation.mean():.2f}" if d.propagation.notna().any() else "-",
-                     "never recovered": int(d.censored.sum()) if d.propagation.notna().any() else "-"})
+                     "never recovered": int(d.censored.sum()) if d.propagation.notna().any() else "-",
+                     "steps w/o FINAL ANSWER": int(d.n_no_answer.sum())})
     o += table(rows)
 
     # --- RQ: does the trust allocator increase resiliency?  paired by task, fork_off vs fork_on
@@ -154,11 +156,15 @@ def analyse(cfg: str, runs: pd.DataFrame, steps: pd.DataFrame, high: float, low:
     o += [""]
 
     # --- VQ1: is the trust score a good predictor of step inaccuracy?  clean runs with allocator (no injected message)
-    s = steps[(steps.kind == "baseline") & (steps.trust == "on") & steps.trust_score.notna()]
+    s_all = steps[(steps.kind == "baseline") & (steps.trust == "on") & steps.trust_score.notna()]
+    s = s_all[s_all.has_answer]  # a step with no FINAL ANSWER (cut off / empty) is a setup failure, not a reasoning error
     c, w = s[s.step_correct].trust_score.to_numpy(float), s[~s.step_correct].trust_score.to_numpy(float)
     o += ["## VQ1 (internal / reasoning errors): is the trust score a good predictor of step inaccuracy?", "",
-          f"Clean runs with the allocator: {len(s)} steps, {len(w)} inaccurate.", ""]
+          f"Clean runs with the allocator: {len(s)} steps with an answer, {len(w)} inaccurate "
+          f"({len(s_all) - len(s)} steps without any FINAL ANSWER excluded).", ""]
     if len(c) and len(w):
+        if min(len(c), len(w)) < 5:
+            o += [f"**Warning: only {min(len(c), len(w))} steps in the smaller class - the numbers below are not interpretable yet.**", ""]
         a = auc(c, w)
         rng, tasks = np.random.default_rng(0), s.task_id.unique()
         boot = []
@@ -199,7 +205,7 @@ def analyse(cfg: str, runs: pd.DataFrame, steps: pd.DataFrame, high: float, low:
     o += ["## Exploratory: allocator mistakes vs. recovery", "",
           f"A mistake = high trust (>= {high}) on an inaccurate step, or low trust (< {low}) on an accurate step "
           "(thresholds inherited from the former high / low labels; only used here).", ""]
-    s_on = steps[(steps.kind == "baseline") & (steps.trust == "on") & steps.trust_score.notna()]
+    s_on = s
     cls = np.where(s_on.trust_score >= high, "high trust", np.where(s_on.trust_score < low, "low trust", "medium trust"))
     ct = pd.crosstab(pd.Series(cls, name="trust"), s_on.step_correct.map({True: "accurate step", False: "inaccurate step"}).rename("step"))
     o += ["Clean allocator-on steps:", ""] + table([{"": i, **{c: int(v) for c, v in r.items()}} for i, r in ct.iterrows()])
