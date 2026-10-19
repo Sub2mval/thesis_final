@@ -47,3 +47,8 @@ mid-thinking and the answer came back empty (`(no answer produced)`). Now (1) al
 the history passes num_ctx/2 (full history is still stored), (2) the Python tool's output is capped like the others, (3) a message that ends
 without `FINAL ANSWER:` is retried once with a "give your best answer now" nudge, (4) every call records `done_reason` and logs a warning when it is
 `length`. `analyze.py` reports steps without a FINAL ANSWER separately and excludes them from VQ1.
+
+**What the trust allocator sees.** Exactly what the audited agent could see, and nothing more: the task, the public answers so far,
+the attachment, and the audited agent's OWN tool calls and raw tool outputs, in a block labelled `[TOOL OUTPUTS SEEN BY Agent N]`
+(shortened the same way the agent's own view was). Never its reasoning, never another agent's tool results. For an injected message 1
+the auditor sees Agent 1's genuine tool outputs next to the corrupted text (the same in every injected run).

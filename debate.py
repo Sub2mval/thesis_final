@@ -7,8 +7,8 @@ Agent 1's first answer (message 1) is generated ONCE per task (first_answer) and
 (run_debate(first=...)): clean runs from the original, injected runs from one shared corrupted copy
 (error_injection.make_injection). So the injection is identical with and without the allocator.
 
-The allocator scores every answer right after it is produced (it sees the task, the public answers and the
-attachment, never any reasoning). The next agent sees ONLY the trust score (1-5) and the reasons for the single
+The allocator scores every answer right after it is produced. It sees what the audited agent could see: the task,
+the public answers, the attachment and that agent's own tool outputs (labelled as such), never its reasoning. The next agent sees ONLY the trust score (1-5) and the reasons for the single
 answer that reaches it; there is no trust label. Verdicts are kept in state["trust"], apart from the public log.
 """
 
@@ -20,12 +20,12 @@ import uuid
 from typing import Annotated, TypedDict
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
-from agents import make_agent, make_llm
+from agents import CFG, MaskOldObservations, make_agent, make_llm
 from Gricean_check import (GRICEAN_METRICS, attachment_blocks, format_combined_reason, format_conversation,
                            format_gricean_check_prompt, trust_score)
 
@@ -111,13 +111,37 @@ class Report(BaseModel):
     manner: Maxim
 
 
-def audit(model: str, task: str, log: list, file: str | None) -> dict:
-    """Gricean audit of the LAST public answer -> {score (mean of 4 maxims, 1-5), maxims, reason}."""
+def seen_tool_outputs(msgs: list, agent: str) -> str:
+    """The tool calls + raw tool outputs the audited agent could see, labelled as such (empty if it used no tools).
+    The auditor must see exactly what the agent saw, and no more: so ONLY this agent's own private tool traffic (never
+    another agent's, never its reasoning), shortened the way the agent's last model call saw it (MaskOldObservations)."""
+    msgs = list(msgs)
+    MaskOldObservations(budget=int(CFG["num_ctx"] * 1.2)).apply(msgs)
+    calls = {c["id"]: c for m in msgs if isinstance(m, AIMessage) for c in m.tool_calls}
+    lines = []
+    for m in msgs:
+        if isinstance(m, ToolMessage):
+            c = calls.get(m.tool_call_id, {})
+            args = ", ".join(f"{k}={v!r}" for k, v in (c.get("args") or {}).items())
+            lines.append(f"Tool call {len(lines) + 1}: {c.get('name') or m.name}({args})\nTool output:\n{m.content}")
+    if not lines:
+        return ""
+    return (f"\n\n[TOOL OUTPUTS SEEN BY Agent {agent}]\nThese are the raw results returned by Agent {agent}'s own tools "
+            "(web search, file reader, Python), exactly as the agent saw them while working; very long older outputs were "
+            "shortened to a preview for the agent too. They are evidence available to the agent in addition to the task and "
+            "conversation above. They are not the agent's reasoning, and no other agent's tool results are shown.\n\n"
+            + "\n\n".join(lines) + f"\n[END OF TOOL OUTPUTS SEEN BY Agent {agent}]")
+
+
+def audit(model: str, task: str, log: list, file: str | None, seen: str = "") -> dict:
+    """Gricean audit of the LAST public answer -> {score (mean of 4 maxims, 1-5), maxims, reason}.
+    `seen` = the audited agent's tool outputs (seen_tool_outputs), given to the auditor as labelled evidence."""
     who = lambda e: f"Agent {e['agent']} (round {e['round']})"
     prompt = format_gricean_check_prompt(
         task=task, conversation=format_conversation([{"source": who(e), "content": e["text"]} for e in log]),
         last_speaker=who(log[-1]))
-    msg = HumanMessage(content=[{"type": "text", "text": prompt}] + attachment_blocks(file))
+    msg = HumanMessage(content=[{"type": "text", "text": prompt}] + attachment_blocks(file)
+                       + ([{"type": "text", "text": seen}] if seen else []))
     llm, err = make_llm(model, "trust_audit").with_structured_output(Report), None
     for _ in range(2):  # local models occasionally return unusable JSON: one retry, then give up gracefully
         try:
@@ -171,8 +195,9 @@ def build_graph(models: dict[str, str], trust_model: str | None, db: str):
 
     def trust_node(s: State):
         last = s["log"][-1]
-        return {"trust": [{"round": last["round"], "agent": last["agent"],
-                           **audit(trust_model, s["question"], s["log"], s.get("file"))}]}
+        seen = seen_tool_outputs(s.get("hist", {}).get(last["agent"], []), last["agent"])
+        return {"trust": [{"round": last["round"], "agent": last["agent"], "saw_tool_outputs": bool(seen),
+                           **audit(trust_model, s["question"], s["log"], s.get("file"), seen)}]}
 
     def aggregate(s: State):
         prompt = (f"{s['question']}\n\nThree agents answered, criticized and refined each other's work over "
