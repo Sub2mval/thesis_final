@@ -13,7 +13,7 @@ Per task this gives the 4 conditions of the experiment (slide 6):
 Message 1 and its corruption are generated once per task and shared by all four conditions.
 .md = concise public trace; .full.md = + every model call (inputs, reasoning, outputs). Then run: python analyze.py <results>
 
-Setup: .env next to this script with TAVILY_API_KEY (web search) and, for the ONE-TIME GAIA download only, HF_TOKEN.
+Setup: .env next to this script with TAVILY_API_KEY (web search; comma-separate several keys to rotate) and, for the ONE-TIME GAIA download only, HF_TOKEN.
 A local Ollama server must have every model pulled (`ollama pull <tag>`). pip install -r requirements.txt
 """
 
@@ -362,8 +362,9 @@ def check_models(args: argparse.Namespace) -> None:
 def main() -> int:
     args = parse_args()
     load_dotenv(args.dotenv, override=False)
-    if not os.getenv("TAVILY_API_KEY", "").strip():
-        raise SystemExit("TAVILY_API_KEY missing in .env (web search tool)")
+    if not agents.tavily_keys():
+        raise SystemExit("TAVILY_API_KEY missing in .env (web search tool; several keys may be comma separated)")
+    log(f"Tavily keys available: {len(agents.tavily_keys())} (each free key = 1000 searches; rotates on quota errors)")
     agents.CFG.update(num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, timeout=args.llm_timeout)
     check_models(args)
     ensure_gaia(next((os.getenv(v) for v in ("HF_TOKEN", "HUGGINGFACE_TOKEN") if os.getenv(v)), None))  # no-op after the 1st run

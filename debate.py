@@ -22,6 +22,7 @@ from typing import Annotated, TypedDict
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
@@ -48,7 +49,18 @@ FORCE_ANSWER = ("You ran out of room or steps before giving an answer. Using onl
 def run_agent(model: str, messages: list) -> list:
     """Run the tool-using agent. If it ends without a `FINAL ANSWER:` (generation cut off, step limit, format slip),
     ask once more for a best-effort answer, so a message is never empty because of infrastructure limits."""
-    run = lambda m: make_agent(model).invoke({"messages": m}, {"recursion_limit": 40})["messages"]  # <= ~20 tool steps
+    def run(m):
+        """One agent run, at most ~20 tool steps. Streams the state so that, if the step limit is hit, the work done so far
+        is kept (it used to be lost, and the whole condition failed with GraphRecursionError)."""
+        out = m
+        try:
+            for chunk in make_agent(model).stream({"messages": m}, {"recursion_limit": 40}, stream_mode="values"):
+                out = chunk["messages"]
+        except GraphRecursionError:
+            out = list(out)
+            while out and isinstance(out[-1], AIMessage) and out[-1].tool_calls:  # drop a tool request that never got its result
+                out.pop()
+        return out
     out = run(messages)
     if "FINAL ANSWER:" not in (out[-1].content or ""):
         out = run(out + [{"role": "user", "content": FORCE_ANSWER}])

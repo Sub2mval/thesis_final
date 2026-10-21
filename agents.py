@@ -6,6 +6,7 @@ Only web search (Tavily) and the one-time GAIA download touch the internet.
 
 import glob
 import os
+import re
 from dataclasses import dataclass
 from functools import cache
 
@@ -78,16 +79,39 @@ def read_file(path_or_url: str, offset: int = 0) -> str:
     return file_text(path_or_url, offset)
 
 
+_QUOTA = re.compile(r"usage limit|limit exceeded|exceeds your plan|out of credits|credits|quota|rate limit|too many requests|"
+                    r"unauthorized|invalid api key|forbidden|\b(401|403|429|432|433)\b", re.I)
+_key = 0  # index of the Tavily key in use; sticks after a rotation so exhausted keys are not retried first
+
+
+def tavily_keys() -> list[str]:
+    """TAVILY_API_KEYS (or TAVILY_API_KEY) may hold several keys, comma / space separated. The free tier is 1000
+    credits per key and a full run needs several thousand searches, so a quota error moves on to the next key."""
+    raw = os.getenv("TAVILY_API_KEYS") or os.getenv("TAVILY_API_KEY") or ""
+    return [k for k in re.split(r"[,\s]+", raw) if k]
+
+
 @tool
 def web_search(query: str) -> str:
     """Search the web. Returns titles, URLs and snippets; open a promising page afterwards with read_file(url)."""
-    try:
-        res = TavilySearch(max_results=5).invoke({"query": query})
-        if not isinstance(res, dict) or "results" not in res:
-            return str(res)[:MAX_CHARS]
-        return "\n\n".join(f"{r['title']} ({r['url']})\n{r['content']}" for r in res["results"])[:MAX_CHARS]
-    except Exception as e:  # a failed search must not crash the debate: the agent sees the error and can adapt
-        return f"ERROR: web search failed: {type(e).__name__}: {e}"
+    global _key
+    keys = tavily_keys()
+    err = "no Tavily key configured"
+    for _ in range(max(len(keys), 1)):
+        try:
+            res = TavilySearch(max_results=5, tavily_api_key=keys[_key % len(keys)] if keys else None).invoke({"query": query})
+            if isinstance(res, dict) and res.get("error"):
+                raise RuntimeError(res["error"])
+            if not isinstance(res, dict) or "results" not in res:
+                return str(res)[:MAX_CHARS]
+            return "\n\n".join(f"{r['title']} ({r['url']})\n{r['content']}" for r in res["results"])[:MAX_CHARS]
+        except Exception as e:  # a failed search must not crash the debate: the agent sees the error and can adapt
+            err = f"{type(e).__name__}: {e}"
+            if len(keys) > 1 and _QUOTA.search(err):  # key exhausted / rejected -> rotate to the next one and retry
+                _key += 1
+                continue
+            break
+    return f"ERROR: web search failed: {err}"
 
 
 SYSTEM = """You are a careful research assistant solving a GAIA benchmark question, possibly as one member of a team that debates the answer.
@@ -95,7 +119,7 @@ Work in several steps: plan, call tools, read their results, and keep going unti
 - web_search(query): find facts; then open a page with read_file(url).
 - read_file(path_or_url, offset=0): read an attachment (pdf, docx, xlsx, pptx, csv, json, zip, html...) or a web page as markdown, one page at a time; long documents continue at the offset the page names.
 - Python_REPL: run Python for any calculation or data processing (state persists between calls; always print() what you want to see). Never do arithmetic in your head.
-Older tool outputs are shortened to a preview to save space, so write down the facts you need as you find them. If a tool returns an error, fix the call or try another approach.
+You have roughly 15 tool calls per turn: stop researching and answer before they run out. Older tool outputs are shortened to a preview to save space, so write down the facts you need as you find them. If a tool returns an error, fix the call or try another approach.
 Finish with a concise, auditable explanation (key evidence and calculations) and a last line `FINAL ANSWER: ...`, where the answer is a number (no units or commas unless asked), a few words, or a comma-separated list."""
 
 
