@@ -396,7 +396,8 @@ def main() -> int:
 
     rec = Recorder()
     rec.verbose = not args.quiet
-    agents.TOOL_HOOK = lambda ev, name, info: rec.verbose and log(f"      tool {name}: {info}" if ev == "start" else f"      !! tool {name} {'ABANDONED after' if ev == 'timeout' else 'was slow:'} {info}")
+    agents.TOOL_HOOK = lambda ev, name, info: rec.verbose and log(
+        f"      tool {name}: {info}" if ev == "start" else f"        -> {name} done in {info}" if ev == "end" else f"      !! tool {name} ABANDONED after {info}")
     install_recorder(rec)
     rows: list[dict] = []
     for ti, tid in enumerate(ids, 1):
