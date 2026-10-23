@@ -4,9 +4,12 @@ All model calls go to the local Ollama server (host from the OLLAMA_HOST env var
 Only web search (Tavily) and the one-time GAIA download touch the internet.
 """
 
+import functools
 import glob
 import os
 import re
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from functools import cache
@@ -27,10 +30,14 @@ from gaia_data import GAIA_DIR
 TRUST_MODELS = ("muse-glimmer:30b", "gemma4:31b", "qwen3.8:27b")
 AGENT_MODELS = TRUST_MODELS + ("gemma4:12b", "qwen3.5:9b")
 
+os.environ.setdefault("MPLBACKEND", "Agg")  # plt.show() must never wait for a window
 MAX_CHARS = 8_000  # one page of tool output (read_file pages through longer documents with `offset`)
 # Run-wide settings, overwritten from the CLI by the runner.
 # num_ctx matters: Ollama's default window is tiny and silently drops the oldest messages (question, system prompt).
 CFG = {"num_ctx": 32768, "think": True, "temperature": 0.0, "seed": 42, "timeout": 900.0, "cloud": True}
+
+TOOL_TIMEOUT = 120.0  # seconds one tool call may take; Tavily, URL fetching and the Python shell have no timeout of their own
+TOOL_HOOK = None  # optional callable(event, tool_name, info), set by the runner to log tool starts / slow or abandoned calls
 
 # Ollama Cloud (the default backend): only gemma4:31b is served there, under the tag below. Several keys share the load.
 CLOUD_HOST = os.getenv("OLLAMA_CLOUD_HOST", "https://ollama.com")  # (overridable so the tests can point it at a fake)
@@ -87,6 +94,40 @@ def make_llm(model: str, role: str) -> ChatOllama:
 
 
 # ---------------------------------------------------------------------------------------------- tools
+def guarded(fn):
+    """Tool wrapper: runs the call in a thread and gives up after TOOL_TIMEOUT s, returning an ERROR text the agent can react
+    to (before, one hung search / download / `input()` / endless loop froze the whole run silently). An abandoned call is
+    left behind; if it was the Python shell, its stdout capture is undone so the program's own output keeps working."""
+    @functools.wraps(fn)
+    def run(*a, **kw):
+        res, stdout, t0 = {}, sys.stdout, time.time()
+        arg = str((list(kw.values()) + list(a) or [""])[0]).replace("\n", " ")[:80]
+        TOOL_HOOK and TOOL_HOOK("start", fn.__name__, arg)
+
+        def work():
+            try:
+                res["out"] = fn(*a, **kw)
+            except BaseException as e:  # noqa: BLE001 - reported to the caller below
+                res["err"] = e
+        th = threading.Thread(target=work, daemon=True)
+        th.start()
+        th.join(TOOL_TIMEOUT)
+        if th.is_alive():
+            sys.stdout = stdout
+            TOOL_HOOK and TOOL_HOOK("timeout", fn.__name__, f"{time.time() - t0:.0f}s")
+            return (f"ERROR: {fn.__name__} did not finish within {TOOL_TIMEOUT:g} s and was abandoned (endless loop, waiting for "
+                    "input, or a stalled network request). Try a simpler or different approach.")
+        TOOL_HOOK and time.time() - t0 > 20 and TOOL_HOOK("slow", fn.__name__, f"{time.time() - t0:.0f}s")
+        if "err" in res:
+            raise res["err"]
+        return res["out"]
+    return run
+
+
+def _no_input(*a, **kw):
+    raise EOFError("input() is not available: nobody can type; put the values in the code")
+
+
 @cache
 def _convert(path_or_url: str) -> str:
     """Full text of a local file (pdf, docx, xlsx, pptx, csv, json, zip, html, ...) or web page, converted once per run."""
@@ -110,6 +151,7 @@ def file_text(path_or_url: str, offset: int = 0) -> str:
 
 
 @tool
+@guarded
 def read_file(path_or_url: str, offset: int = 0) -> str:
     """Read a local file (pdf, docx, xlsx, pptx, csv, json, zip, html, mp3...) or a web page URL as markdown, one page at a time.
     Long documents continue at `offset` (the page tells you which)."""
@@ -128,6 +170,7 @@ def tavily_keys() -> list[str]:
 
 
 @tool
+@guarded
 def web_search(query: str) -> str:
     """Search the web. Returns titles, URLs and snippets; open a promising page afterwards with read_file(url)."""
     global _key
@@ -162,12 +205,12 @@ Finish with a concise, auditable explanation (key evidence and calculations) and
 def python_tool():
     """Stateful Python shell (state persists between calls of one agent session) with capped output and a print() hint."""
     repl = PythonREPLTool()
+    repl.python_repl.globals["input"] = _no_input
 
-    @tool("Python_REPL")
-    def run(query: str) -> str:
+    def Python_REPL(query: str) -> str:
         """Run Python code. State persists between calls. Always print() what you want to see."""
         return (repl.invoke(query) or "(no output - did you forget print()?)")[:MAX_CHARS]
-    return run
+    return tool(guarded(Python_REPL))
 
 
 @dataclass
