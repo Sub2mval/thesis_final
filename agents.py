@@ -15,13 +15,13 @@ from dataclasses import dataclass
 from functools import cache
 
 import ollama
+import requests
 from langchain.agents import create_agent
 from langchain.agents.middleware import ContextEditingMiddleware
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import tool
 from langchain_experimental.tools import PythonREPLTool
 from langchain_ollama import ChatOllama
-from langchain_tavily import TavilySearch
 from markitdown import MarkItDown
 
 from gaia_data import GAIA_DIR
@@ -37,7 +37,7 @@ MAX_CHARS = 8_000  # one page of tool output (read_file pages through longer doc
 CFG = {"num_ctx": 32768, "think": True, "temperature": 0.0, "seed": 42, "timeout": 900.0, "cloud": True}
 
 TOOL_TIMEOUT = 120.0  # seconds one tool call may take; Tavily, URL fetching and the Python shell have no timeout of their own
-TOOL_HOOK = None  # optional callable(event, tool_name, info), set by the runner to log tool starts / slow or abandoned calls
+TOOL_HOOK = None  # optional callable(event, tool_name, info), set by the runner to log tool starts, ends and abandoned calls
 
 # Ollama Cloud (the default backend): only gemma4:31b is served there, under the tag below. Several keys share the load.
 CLOUD_HOST = os.getenv("OLLAMA_CLOUD_HOST", "https://ollama.com")  # (overridable so the tests can point it at a fake)
@@ -117,9 +117,9 @@ def guarded(fn):
             TOOL_HOOK and TOOL_HOOK("timeout", fn.__name__, f"{time.time() - t0:.0f}s")
             return (f"ERROR: {fn.__name__} did not finish within {TOOL_TIMEOUT:g} s and was abandoned (endless loop, waiting for "
                     "input, or a stalled network request). Try a simpler or different approach.")
-        TOOL_HOOK and time.time() - t0 > 20 and TOOL_HOOK("slow", fn.__name__, f"{time.time() - t0:.0f}s")
         if "err" in res:
             raise res["err"]
+        TOOL_HOOK and TOOL_HOOK("end", fn.__name__, f"{time.time() - t0:.1f}s, {len(str(res['out']))} chars")
         return res["out"]
     return run
 
@@ -158,8 +158,7 @@ def read_file(path_or_url: str, offset: int = 0) -> str:
     return file_text(path_or_url, offset)
 
 
-_QUOTA = re.compile(r"usage limit|limit exceeded|exceeds your plan|out of credits|credits|quota|rate limit|too many requests|"
-                    r"unauthorized|invalid api key|forbidden|\b(401|403|429|432|433)\b", re.I)
+TAVILY_SKIP_CODES = {401, 403, 429, 432, 433}  # bad key / rate limited / plan or credit limit exceeded -> next key
 _key = 0  # index of the Tavily key in use; sticks after a rotation so exhausted keys are not retried first
 
 
@@ -175,22 +174,21 @@ def web_search(query: str) -> str:
     """Search the web. Returns titles, URLs and snippets; open a promising page afterwards with read_file(url)."""
     global _key
     keys = tavily_keys()
-    err = "no Tavily key configured"
     for _ in range(max(len(keys), 1)):
-        try:
-            res = TavilySearch(max_results=5, tavily_api_key=keys[_key % len(keys)] if keys else None).invoke({"query": query})
-            if isinstance(res, dict) and res.get("error"):
-                raise RuntimeError(res["error"])
-            if not isinstance(res, dict) or "results" not in res:
-                return str(res)[:MAX_CHARS]
-            return "\n\n".join(f"{r['title']} ({r['url']})\n{r['content']}" for r in res["results"])[:MAX_CHARS]
-        except Exception as e:  # a failed search must not crash the debate: the agent sees the error and can adapt
-            err = f"{type(e).__name__}: {e}"
-            if len(keys) > 1 and _QUOTA.search(err):  # key exhausted / rejected -> rotate to the next one and retry
-                _key += 1
-                continue
-            break
-    return f"ERROR: web search failed: {err}"
+        key = keys[_key % len(keys)] if keys else ""
+        try:  # plain REST call with a timeout (the langchain wrapper had none)
+            r = requests.post("https://api.tavily.com/search", json={"query": query, "max_results": 5},
+                              headers={"Authorization": f"Bearer {key}"}, timeout=30)
+        except requests.RequestException as e:  # a failed search must not crash the debate: the agent sees the error
+            return f"ERROR: web search failed: {type(e).__name__}: {e}"
+        if r.status_code in TAVILY_SKIP_CODES and len(keys) > 1:  # key exhausted / rejected -> next key
+            _key += 1
+            continue
+        if r.status_code != 200:
+            return f"ERROR: web search failed: HTTP {r.status_code} {r.text[:200]}"
+        hits = r.json().get("results") or []
+        return ("\n\n".join(f"{h['title']} ({h['url']})\n{h['content']}" for h in hits) or "(no results)")[:MAX_CHARS]
+    return f"ERROR: web search failed: all {len(keys)} Tavily keys are exhausted or rejected"
 
 
 SYSTEM = """You are a careful research assistant solving a GAIA benchmark question, possibly as one member of a team that debates the answer.
