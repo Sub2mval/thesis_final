@@ -111,7 +111,7 @@ def install_recorder(rec: Recorder, retries: int = 2) -> None:
     import httpx
     from langchain_ollama import ChatOllama
 
-    orig = ChatOllama._generate
+    orig = ChatOllama._orig_generate = getattr(ChatOllama, "_orig_generate", ChatOllama._generate)  # idempotent: re-installing re-wraps the original
 
     def _generate(self, messages, *a, **kw):
         kind, model = (self.metadata or {}).get("role", "llm_call"), self.model
@@ -326,7 +326,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-ctx", type=int, default=32768, help="Ollama context window in tokens (default 32768)")
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--no-think", action="store_true", help="disable thinking mode (it is skipped automatically for models without it)")
-    p.add_argument("--llm-timeout", type=float, help="seconds an Ollama request may stay silent before a retry (default 300 cloud, 900 local)")
+    p.add_argument("--llm-timeout", type=float, help="seconds an Ollama request may stay silent before a retry (default 60 cloud, 900 local)")
     p.add_argument("--seed", type=int, default=42, help="seed for --n-questions sampling and Ollama sampling")
     p.add_argument("--output-dir", help="default: results/agents-<models>__trust-<model>")
     p.add_argument("--work-dir", default=str(HERE / ".gaia_work"), help="scratch dir for the sqlite checkpoints")
@@ -375,7 +375,7 @@ def main() -> int:
     if not agents.tavily_keys():
         raise SystemExit("TAVILY_API_KEY / TAVILY_API_KEY_1, _2, ... missing in .env (web search tool)")
     log(f"Tavily keys: {len(agents.tavily_keys())} (1000 searches each) | Ollama Cloud keys: {len(agents.numbered_keys('OLLAMA_API_KEY'))}")
-    agents.CFG.update(cloud=args.backend == "cloud", num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, timeout=args.llm_timeout or (300.0 if args.backend == "cloud" else 900.0))
+    agents.CFG.update(cloud=args.backend == "cloud", num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, timeout=args.llm_timeout or (60.0 if args.backend == "cloud" else 900.0))
     check_models(args)
     ensure_gaia(next((os.getenv(v) for v in ("HF_TOKEN", "HUGGINGFACE_TOKEN") if os.getenv(v)), None))  # no-op after the 1st run
     tasks = load_tasks()
@@ -398,7 +398,8 @@ def main() -> int:
     rec.verbose = not args.quiet
     agents.TOOL_HOOK = lambda ev, name, info: rec.verbose and log(
         f"      tool {name}: {info}" if ev == "start" else f"        -> {name} done in {info}" if ev == "end" else f"      !! tool {name} ABANDONED after {info}")
-    install_recorder(rec)
+    agents.NOTE_HOOK = lambda msg: log(f"      !! {msg}")
+    install_recorder(rec, retries=0 if args.backend == "cloud" else 2)  # cloud: a failed call moves to the next key instead
     rows: list[dict] = []
     for ti, tid in enumerate(ids, 1):
         log(f"=== Task {ti}/{len(ids)}: {tid} (level {tasks[tid]['Level']}) ===")
