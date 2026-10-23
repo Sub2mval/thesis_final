@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from functools import cache
 
+import httpx
 import ollama
 import requests
 from langchain.agents import create_agent
@@ -37,6 +38,7 @@ MAX_CHARS = 8_000  # one page of tool output (read_file pages through longer doc
 CFG = {"num_ctx": 32768, "think": True, "temperature": 0.0, "seed": 42, "timeout": 900.0, "cloud": True}
 
 TOOL_TIMEOUT = 120.0  # seconds one tool call may take; Tavily, URL fetching and the Python shell have no timeout of their own
+NOTE_HOOK = None  # optional callable(message), set by the runner to log key rotations
 TOOL_HOOK = None  # optional callable(event, tool_name, info), set by the runner to log tool starts, ends and abandoned calls
 
 # Ollama Cloud (the default backend): only gemma4:31b is served there, under the tag below. Several keys share the load.
@@ -55,23 +57,28 @@ _ollama_key = 0  # round-robin position over OLLAMA_API_KEY, _1, _2, ...
 
 
 class CloudChatOllama(ChatOllama):
-    """ChatOllama on Ollama Cloud with key rotation: every call starts on the next key; a key that is rate limited or
-    rejected (401/403/429/529) is skipped; when every key is limited, wait (5 s, 10 s, ... max 120 s) and go round again."""
+    """ChatOllama on Ollama Cloud with key rotation: every call starts on the next key. A key that is rate limited or rejected
+    (401/403/429/529) or whose connection stalls / drops (timeout: one bad key or node must not freeze the run) is skipped;
+    when every key has failed, wait (5 s, 10 s, ... max 120 s) and go round again."""
 
     def _generate(self, messages, *a, **kw):
         global _ollama_key
         keys = numbered_keys("OLLAMA_API_KEY")
         for rnd in range(10):
             for _ in keys:
-                key, _ollama_key = keys[_ollama_key % len(keys)], _ollama_key + 1
-                self._client = ollama.Client(host=CLOUD_HOST, headers={"Authorization": f"Bearer {key}"}, timeout=CFG["timeout"])
+                i, _ollama_key = _ollama_key % len(keys), _ollama_key + 1
+                self._client = ollama.Client(host=CLOUD_HOST, headers={"Authorization": f"Bearer {keys[i]}"}, timeout=CFG["timeout"])
                 try:
                     return super()._generate(messages, *a, **kw)
                 except ollama.ResponseError as e:
                     if e.status_code not in SKIP_KEY_CODES:
                         raise
+                    why = f"HTTP {e.status_code}"
+                except (httpx.TransportError, ConnectionError, TimeoutError) as e:
+                    why = f"{type(e).__name__} after up to {CFG['timeout']:g}s of silence"
+                NOTE_HOOK and NOTE_HOOK(f"Ollama key #{i + 1}/{len(keys)}: {why}; trying the next key")
             time.sleep(min(5 * 2 ** rnd, 120))
-        raise RuntimeError(f"All {len(keys)} Ollama keys are limited or invalid (tried 10 rounds)")
+        raise RuntimeError(f"All {len(keys)} Ollama keys failed or are limited (tried 10 rounds)")
 
 
 @cache
