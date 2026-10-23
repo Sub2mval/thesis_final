@@ -2,7 +2,7 @@ langgraph
 langgraph-checkpoint-sqlite
 langchain
 langchain-ollama
-langchain-tavily
+requests
 langchain-experimental
 markitdown[all]
 python-dotenv
