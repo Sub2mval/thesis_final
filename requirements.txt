@@ -4,7 +4,7 @@ langchain
 langchain-ollama
 langchain-tavily
 langchain-experimental
-"markitdown[all]"
+markitdown[all]
 python-dotenv
 huggingface_hub
 ollama
