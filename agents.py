@@ -7,6 +7,7 @@ Only web search (Tavily) and the one-time GAIA download touch the internet.
 import glob
 import os
 import re
+import time
 from dataclasses import dataclass
 from functools import cache
 
@@ -29,7 +30,41 @@ AGENT_MODELS = TRUST_MODELS + ("gemma4:12b", "qwen3.5:9b")
 MAX_CHARS = 8_000  # one page of tool output (read_file pages through longer documents with `offset`)
 # Run-wide settings, overwritten from the CLI by the runner.
 # num_ctx matters: Ollama's default window is tiny and silently drops the oldest messages (question, system prompt).
-CFG = {"num_ctx": 32768, "think": True, "temperature": 0.0, "seed": 42, "timeout": 900.0}
+CFG = {"num_ctx": 32768, "think": True, "temperature": 0.0, "seed": 42, "timeout": 900.0, "cloud": True}
+
+# Ollama Cloud (the default backend): only gemma4:31b is served there, under the tag below. Several keys share the load.
+CLOUD_HOST = os.getenv("OLLAMA_CLOUD_HOST", "https://ollama.com")  # (overridable so the tests can point it at a fake)
+CLOUD_MODELS = {"gemma4:31b": "gemma4:31b-cloud"}
+SKIP_KEY_CODES = {401, 403, 429, 529}  # bad key / rate limited / overloaded -> try the next key
+
+
+def numbered_keys(prefix: str) -> list[str]:
+    """PREFIX, PREFIX_1, PREFIX_2, ... from the environment (.env), quotes stripped, duplicates dropped, order kept."""
+    keys = [os.getenv(n, "").strip().strip("\"'") for n in [prefix] + [f"{prefix}_{i}" for i in range(1, 100)]]
+    return list(dict.fromkeys(k for k in keys if k))
+
+
+_ollama_key = 0  # round-robin position over OLLAMA_API_KEY, _1, _2, ...
+
+
+class CloudChatOllama(ChatOllama):
+    """ChatOllama on Ollama Cloud with key rotation: every call starts on the next key; a key that is rate limited or
+    rejected (401/403/429/529) is skipped; when every key is limited, wait (5 s, 10 s, ... max 120 s) and go round again."""
+
+    def _generate(self, messages, *a, **kw):
+        global _ollama_key
+        keys = numbered_keys("OLLAMA_API_KEY")
+        for rnd in range(10):
+            for _ in keys:
+                key, _ollama_key = keys[_ollama_key % len(keys)], _ollama_key + 1
+                self._client = ollama.Client(host=CLOUD_HOST, headers={"Authorization": f"Bearer {key}"}, timeout=CFG["timeout"])
+                try:
+                    return super()._generate(messages, *a, **kw)
+                except ollama.ResponseError as e:
+                    if e.status_code not in SKIP_KEY_CODES:
+                        raise
+            time.sleep(min(5 * 2 ** rnd, 120))
+        raise RuntimeError(f"All {len(keys)} Ollama keys are limited or invalid (tried 10 rounds)")
 
 
 @cache
@@ -43,10 +78,12 @@ def capabilities(model: str) -> tuple:
 
 def make_llm(model: str, role: str) -> ChatOllama:
     """`role` (agent_call | trust_audit | corruption) goes into metadata so the trace recorder can label the call."""
+    common = dict(temperature=CFG["temperature"], seed=CFG["seed"], num_ctx=CFG["num_ctx"], metadata={"role": role})
+    if CFG["cloud"]:
+        return CloudChatOllama(model=CLOUD_MODELS[model], base_url=CLOUD_HOST, reasoning=CFG["think"], **common)
     caps = capabilities(model)
     think = CFG["think"] and ("thinking" in caps or not caps)  # models without thinking support reject think=True
-    return ChatOllama(model=model, reasoning=think, temperature=CFG["temperature"], seed=CFG["seed"],
-                      num_ctx=CFG["num_ctx"], client_kwargs={"timeout": CFG["timeout"]}, metadata={"role": role})
+    return ChatOllama(model=model, reasoning=think, client_kwargs={"timeout": CFG["timeout"]}, **common)
 
 
 # ---------------------------------------------------------------------------------------------- tools
@@ -85,10 +122,9 @@ _key = 0  # index of the Tavily key in use; sticks after a rotation so exhausted
 
 
 def tavily_keys() -> list[str]:
-    """TAVILY_API_KEYS (or TAVILY_API_KEY) may hold several keys, comma / space separated. The free tier is 1000
-    credits per key and a full run needs several thousand searches, so a quota error moves on to the next key."""
-    raw = os.getenv("TAVILY_API_KEYS") or os.getenv("TAVILY_API_KEY") or ""
-    return [k for k in re.split(r"[,\s]+", raw) if k]
+    """TAVILY_API_KEY, TAVILY_API_KEY_1, _2, ... (the free tier is 1000 credits per key and a full run needs several
+    thousand searches, so a quota error moves on to the next key)."""
+    return numbered_keys("TAVILY_API_KEY")
 
 
 @tool

@@ -1,8 +1,8 @@
-# LLM-debate + trust allocator (local Ollama) on GAIA
+# LLM-debate + trust allocator on GAIA (Ollama Cloud, gemma4:31b everywhere; local Ollama optional)
 
 ```
-pip install -r requirements.txt            # + a running Ollama with the models pulled (ollama pull <tag>)
-cp .env.example .env                       # TAVILY_API_KEY (web search); HF_TOKEN only for the one-time GAIA download
+pip install -r requirements.txt            # (--backend local only: a running Ollama with the models pulled)
+cp .env.example .env                       # OLLAMA_API_KEY_1, _2, ... and TAVILY_API_KEY_1, _2, ... (same pattern); HF_TOKEN only for the one-time GAIA download
 python run_gaia_benchmark.py --n-questions 5 --agent-models gemma4:31b --trust-model qwen3.8:27b
 python run_gaia_benchmark.py --task-ids <id> --agent-models gemma4:31b gemma4:12b qwen3.5:9b --trust-model muse-glimmer:30b
 python analyze.py results/                 # slides 7-9 -> results/analysis/{report.md,runs.csv,steps.csv}
@@ -12,7 +12,7 @@ python -m pytest tests -q                  # offline tests against a fake Ollama
 | file | role |
 |---|---|
 | `gaia_data.py` | GAIA downloaded once into `data/gaia` (marker `.download_complete`), read locally afterwards; official scorer |
-| `agents.py` | local Ollama LLM factory, tools (web search, read_file, Python), tool-using agent; `TRUST_MODELS` / `AGENT_MODELS` tags live here |
+| `agents.py` | LLM factory (Ollama Cloud with rotating keys / local Ollama), tools (web search, read_file, Python), tool-using agent; `TRUST_MODELS` / `AGENT_MODELS` tags live here |
 | `debate.py` | the LangGraph debate (3 agents, aggregator, optional trust node), trust audit, trust notice |
 | `Gricean_check.py` | the Gricean rubric prompt (verbatim) + trust score = mean of the 4 maxim scores |
 | `error_injection.py` | FM-2.1..2.6 only; the injector picks the best-fitting mode for message 1 and corrupts it once per task (shared by all injected runs) |
@@ -52,3 +52,9 @@ without `FINAL ANSWER:` is retried once with a "give your best answer now" nudge
 the attachment, and the audited agent's OWN tool calls and raw tool outputs, in a block labelled `[TOOL OUTPUTS SEEN BY Agent N]`
 (shortened the same way the agent's own view was). Never its reasoning, never another agent's tool results. For an injected message 1
 the auditor sees Agent 1's genuine tool outputs next to the corrupted text (the same in every injected run).
+
+**Backend and keys (final version).** Default `--backend cloud`: every call (agents, trust allocator, injector) goes to Ollama Cloud
+(`gemma4:31b`, served as `gemma4:31b-cloud`). Keys come from `OLLAMA_API_KEY`, `OLLAMA_API_KEY_1`, `_2`, ... in `.env`; each call starts on the
+next key, a key answering 401/403/429/529 is skipped, and if all are limited the call waits (5 s doubling to 120 s, 10 rounds) and goes round
+again. Web search uses the same pattern with `TAVILY_API_KEY[_n]` (1000 free searches per key; a full 165-task run needs several thousand).
+`--backend local` restores the independent local models (agents / trust / injector from the lists in `agents.py`).

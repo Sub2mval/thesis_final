@@ -2,8 +2,8 @@
 """Run GAIA validation tasks through LLM-debate (local Ollama models) with / without the trust allocator,
 and inject an FM-2.x error into message 1 (Agent 1's first answer), identically for every condition.
 
-    python run_gaia_benchmark.py --n-questions 5 --agent-models gemma4:31b --trust-model qwen3.8:27b
-    python run_gaia_benchmark.py --task-ids <id> --agent-models gemma4:31b gemma4:12b qwen3.5:9b --trust-model muse-glimmer:30b
+    python run_gaia_benchmark.py --n-questions 5                       # Ollama Cloud, gemma4:31b everywhere (default)
+    python run_gaia_benchmark.py --backend local --task-ids <id> --agent-models gemma4:31b gemma4:12b qwen3.5:9b --trust-model muse-glimmer:30b
 
 Per task this gives the 4 conditions of the experiment (slide 6):
     <output-dir>/<task_id>/baseline_off.{json,md,full.md}   1  clean run, no trust allocator
@@ -13,7 +13,7 @@ Per task this gives the 4 conditions of the experiment (slide 6):
 Message 1 and its corruption are generated once per task and shared by all four conditions.
 .md = concise public trace; .full.md = + every model call (inputs, reasoning, outputs). Then run: python analyze.py <results>
 
-Setup: .env next to this script with TAVILY_API_KEY (web search; comma-separate several keys to rotate) and, for the ONE-TIME GAIA download only, HF_TOKEN.
+Setup: .env next to this script with TAVILY_API_KEY[_1, _2, ...] and OLLAMA_API_KEY[_1, _2, ...] (several keys rotate) and, for the ONE-TIME GAIA download only, HF_TOKEN.
 A local Ollama server must have every model pulled (`ollama pull <tag>`). pip install -r requirements.txt
 """
 
@@ -172,7 +172,7 @@ def build_record(*, task: dict, trust: bool, state: dict, condition: str, thread
         "task_id": task["task_id"], "question": task["Question"], "ground_truth": task["Final answer"], "level": task["Level"],
         "attached_file": task["file"], "thread_id": thread_id, "condition": condition, "trust_allocator": trust,
         "agent_models": dict(zip("123", args.agent_models)), "trust_model": args.trust_model,
-        "injector_model": args.injector_model, "temperature": args.temperature, "seed": args.seed, "n_rounds": args.n_rounds,
+        "injector_model": args.injector_model, "backend": args.backend, "temperature": args.temperature, "seed": args.seed, "n_rounds": args.n_rounds,
         "final_answer_raw": final, "final_answer_extracted": extracted,
         "correct": gaia_score(extracted, task["Final answer"]) if final is not None else False,
         "messages": public_messages(state, task["Final answer"]), "trust_history": trust_history(state),
@@ -315,6 +315,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--task-ids", nargs="+", metavar="ID", help="GAIA validation task id(s) (space or comma separated)")
     p.add_argument("--n-questions", type=int, metavar="N", help="random subset of N validation questions; ignored if --task-ids is given")
+    p.add_argument("--backend", choices=("cloud", "local"), default="cloud",
+                   help="cloud (default): Ollama Cloud with rotating OLLAMA_API_KEY[_n] keys, gemma4:31b only; local: your own Ollama server")
     p.add_argument("--agent-models", nargs="+", choices=AGENT_MODELS, default=["gemma4:31b"], metavar="TAG",
                    help=f"ONE tag for all 3 agents, or THREE (agent 1 2 3). Choices: {', '.join(AGENT_MODELS)}")
     p.add_argument("--trust-model", choices=TRUST_MODELS, default="gemma4:31b", help="trust allocator model (independent of the agents)")
@@ -345,6 +347,14 @@ def check_models(args: argparse.Namespace) -> None:
     """Fail fast if Ollama is unreachable, a model is not pulled, or an agent model cannot call tools."""
     import ollama
 
+    if args.backend == "cloud":  # only gemma4:31b is served there; the keys are checked by the first call
+        bad = (set(args.agent_models) | {args.trust_model, args.injector_model}) - set(agents.CLOUD_MODELS)
+        if bad:
+            raise SystemExit(f"Ollama Cloud backend serves only {', '.join(agents.CLOUD_MODELS)} (got {', '.join(sorted(bad))}); use --backend local")
+        if not agents.numbered_keys("OLLAMA_API_KEY"):
+            raise SystemExit("No OLLAMA_API_KEY / OLLAMA_API_KEY_1, _2, ... in .env")
+        return
+
     try:
         have = {m.model for m in ollama.Client().list().models}
     except Exception as e:
@@ -363,9 +373,9 @@ def main() -> int:
     args = parse_args()
     load_dotenv(args.dotenv, override=False)
     if not agents.tavily_keys():
-        raise SystemExit("TAVILY_API_KEY missing in .env (web search tool; several keys may be comma separated)")
-    log(f"Tavily keys available: {len(agents.tavily_keys())} (each free key = 1000 searches; rotates on quota errors)")
-    agents.CFG.update(num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, timeout=args.llm_timeout)
+        raise SystemExit("TAVILY_API_KEY / TAVILY_API_KEY_1, _2, ... missing in .env (web search tool)")
+    log(f"Tavily keys: {len(agents.tavily_keys())} (1000 searches each) | Ollama Cloud keys: {len(agents.numbered_keys('OLLAMA_API_KEY'))}")
+    agents.CFG.update(cloud=args.backend == "cloud", num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, timeout=args.llm_timeout)
     check_models(args)
     ensure_gaia(next((os.getenv(v) for v in ("HF_TOKEN", "HUGGINGFACE_TOKEN") if os.getenv(v)), None))  # no-op after the 1st run
     tasks = load_tasks()
