@@ -35,7 +35,8 @@ os.environ.setdefault("MPLBACKEND", "Agg")  # plt.show() must never wait for a w
 MAX_CHARS = 8_000  # one page of tool output (read_file pages through longer documents with `offset`)
 # Run-wide settings, overwritten from the CLI by the runner.
 # num_ctx matters: Ollama's default window is tiny and silently drops the oldest messages (question, system prompt).
-CFG = {"num_ctx": 32768, "think": True, "temperature": 0.0, "seed": 42, "timeout": 900.0, "cloud": True}
+CFG = {"num_ctx": 32768, "think": True, "temperature": 0.0, "seed": 42, "timeout": 900.0, "cloud": True,
+       "max_tokens": 12288, "max_key_wait": 7200.0}
 
 TOOL_TIMEOUT = 120.0  # seconds one tool call may take; Tavily, URL fetching and the Python shell have no timeout of their own
 NOTE_HOOK = None  # optional callable(message), set by the runner to log key rotations
@@ -53,32 +54,115 @@ def numbered_keys(prefix: str) -> list[str]:
     return list(dict.fromkeys(k for k in keys if k))
 
 
-_ollama_key = 0  # round-robin position over OLLAMA_API_KEY, _1, _2, ...
+class KeysExhausted(RuntimeError):
+    """Every Ollama key is cooling down for longer than --max-key-wait: stop cleanly (everything done is saved; resume later)."""
 
 
-class CloudChatOllama(ChatOllama):
-    """ChatOllama on Ollama Cloud with key rotation: every call starts on the next key. A key that is rate limited or rejected
-    (401/403/429/529) or whose connection stalls / drops (timeout: one bad key or node must not freeze the run) is skipped;
-    when every key has failed, wait (5 s, 10 s, ... max 120 s) and go round again."""
+# ---- generation guards (all backends) ----------------------------------------------------------------------------------
+def shrink(messages, cap: int = 20_000):
+    """Last-resort safety net for 'prompt too long': cut any single message above `cap` characters to its head and tail."""
+    def cut(text: str) -> str:
+        return text if len(text) <= cap else f"{text[:cap // 2]}\n[... {len(text) - cap} characters cut: message far too long ...]\n{text[-cap // 2:]}"
+
+    def fix(m):
+        c = m.content if hasattr(m, "content") else m.get("content")
+        c = cut(c) if isinstance(c, str) else [{**b, "text": cut(b["text"])} if isinstance(b, dict) and b.get("type") == "text" else b for b in c or []]
+        return m.model_copy(update={"content": c}) if hasattr(m, "model_copy") else {**m, "content": c}
+    return [fix(m) for m in messages]
+
+
+def done_reason(res) -> str | None:
+    """Why generation stopped ('stop' | 'length' | ...). Inside _generate it is in generation_info, not yet in response_metadata."""
+    g = res.generations[0]
+    return (g.generation_info or {}).get("done_reason") or (getattr(g.message, "response_metadata", None) or {}).get("done_reason")
+
+
+class GuardedChatOllama(ChatOllama):
+    """ChatOllama that never lets a runaway generation or an oversized prompt wreck a run:
+    * a reply cut off at the output cap (done_reason=length: typically an endless repetition loop inside the thinking, which
+      once filled the whole context with 1M characters) is NOT used; it is regenerated with different sampling, and finally
+      without thinking. With temperature 0 and a fixed seed an identical retry would just loop again.
+    * a 400 'prompt is too long' is retried once with oversized messages cut down (shrink)."""
 
     def _generate(self, messages, *a, **kw):
-        global _ollama_key
-        keys = numbered_keys("OLLAMA_API_KEY")
-        for rnd in range(10):
-            for _ in keys:
-                i, _ollama_key = _ollama_key % len(keys), _ollama_key + 1
-                self._client = ollama.Client(host=CLOUD_HOST, headers={"Authorization": f"Bearer {keys[i]}"}, timeout=CFG["timeout"])
-                try:
-                    return super()._generate(messages, *a, **kw)
-                except ollama.ResponseError as e:
-                    if e.status_code not in SKIP_KEY_CODES:
-                        raise
-                    why = f"HTTP {e.status_code}"
-                except (httpx.TransportError, ConnectionError, TimeoutError) as e:
-                    why = f"{type(e).__name__} after up to {CFG['timeout']:g}s of silence"
-                NOTE_HOOK and NOTE_HOOK(f"Ollama key #{i + 1}/{len(keys)}: {why}; trying the next key")
-            time.sleep(min(5 * 2 ** rnd, 120))
-        raise RuntimeError(f"All {len(keys)} Ollama keys failed or are limited (tried 10 rounds)")
+        def call(obj, msgs):
+            try:
+                return super(GuardedChatOllama, obj)._generate(msgs, *a, **kw)
+            except ollama.ResponseError as e:
+                if e.status_code != 400 or "too long" not in str(e).lower():
+                    raise
+                NOTE_HOOK and NOTE_HOOK(f"prompt too long ({e}); retrying with oversized messages cut down")
+                return super(GuardedChatOllama, obj)._generate(shrink(msgs), *a, **kw)
+
+        res = call(self, messages)
+        for n, change in enumerate(({"temperature": 0.6}, {"temperature": 0.3, "reasoning": False}), 1):
+            if done_reason(res) != "length":
+                break
+            NOTE_HOOK and NOTE_HOOK(f"{self.model}: reply hit the output cap (runaway generation?); regenerating "
+                                    f"({'different sampling' if n == 1 else 'thinking off'}) instead of using it")
+            res = call(self.model_copy(update={**change, "seed": CFG["seed"] + n}), messages)
+        return res
+
+
+# ---- Ollama Cloud keys: round robin with per-key cooldowns ------------------------------------------------------------
+_ollama_key = 0  # round-robin position over OLLAMA_API_KEY, _1, _2, ...
+_cool: dict[str, tuple[float, int]] = {}  # key -> (cooling down until, consecutive failures)
+_lock = threading.Lock()
+
+
+def _pick_key(keys: list[str]) -> tuple[int | None, float]:
+    """Next key (round robin) that is not cooling down -> (index, 0); if all are: (None, seconds until the first is back)."""
+    global _ollama_key
+    with _lock:
+        now = time.time()
+        for _ in keys:
+            i, _ollama_key = _ollama_key % len(keys), _ollama_key + 1
+            if _cool.get(keys[i], (0, 0))[0] <= now:
+                return i, 0.0
+        return None, min(_cool[k][0] for k in keys) - now
+
+
+def _cool_down(key: str, base: float) -> float:
+    """Park a failed key for base * 2^(consecutive failures - 1) seconds (max 2 h); a success resets it. -> seconds."""
+    with _lock:
+        strikes = _cool.get(key, (0, 0))[1] + 1
+        secs = min(base * 2 ** (strikes - 1), 7200)
+        _cool[key] = (time.time() + secs, strikes)
+        return secs
+
+
+class CloudChatOllama(GuardedChatOllama):
+    """Guarded ChatOllama on Ollama Cloud, spread over several keys without 429 death spirals: every call goes to the next key
+    that is not cooling down; a failing key is parked with a growing cooldown instead of being hammered again by every later
+    call (plan usage limit 15 min, other 429/529 20 s, bad key 24 h, stalled connection 30 s; each doubling per repeat, max 2 h).
+    When all keys are parked the call sleeps until the first is back; if that would exceed CFG max_key_wait it raises
+    KeysExhausted (the run stops cleanly and can be resumed)."""
+
+    def _generate(self, messages, *a, **kw):
+        keys, waited = numbered_keys("OLLAMA_API_KEY"), 0.0
+        while True:
+            i, wait = _pick_key(keys)
+            if i is None:
+                if waited + wait > CFG["max_key_wait"]:
+                    raise KeysExhausted(f"all {len(keys)} Ollama keys are rate limited / rejected for another {wait / 60:.0f} min "
+                                        f"(--max-key-wait exceeded); rerun the same command later to resume")
+                NOTE_HOOK and NOTE_HOOK(f"all {len(keys)} Ollama keys are cooling down; waiting {wait:.0f}s for the first one")
+                time.sleep(wait + 1)
+                waited += wait + 1
+                continue
+            self._client = ollama.Client(host=CLOUD_HOST, headers={"Authorization": f"Bearer {keys[i]}"}, timeout=CFG["timeout"])
+            try:
+                res = super()._generate(messages, *a, **kw)
+                _cool.pop(keys[i], None)
+                return res
+            except ollama.ResponseError as e:
+                if e.status_code not in SKIP_KEY_CODES:
+                    raise
+                base = 86400 if e.status_code in (401, 403) else 900 if "usage limit" in str(e).lower() else 20
+                why = f"HTTP {e.status_code}"
+            except (httpx.TransportError, ConnectionError, TimeoutError) as e:
+                base, why = 30, f"{type(e).__name__} after up to {CFG['timeout']:g}s of silence"
+            NOTE_HOOK and NOTE_HOOK(f"Ollama key #{i + 1}/{len(keys)}: {why}; parked for {_cool_down(keys[i], base):.0f}s, trying the next key")
 
 
 @cache
@@ -92,12 +176,12 @@ def capabilities(model: str) -> tuple:
 
 def make_llm(model: str, role: str) -> ChatOllama:
     """`role` (agent_call | trust_audit | corruption) goes into metadata so the trace recorder can label the call."""
-    common = dict(temperature=CFG["temperature"], seed=CFG["seed"], num_ctx=CFG["num_ctx"], metadata={"role": role})
+    common = dict(temperature=CFG["temperature"], seed=CFG["seed"], num_ctx=CFG["num_ctx"], num_predict=CFG["max_tokens"], metadata={"role": role})
     if CFG["cloud"]:
         return CloudChatOllama(model=CLOUD_MODELS[model], base_url=CLOUD_HOST, reasoning=CFG["think"], **common)
     caps = capabilities(model)
     think = CFG["think"] and ("thinking" in caps or not caps)  # models without thinking support reject think=True
-    return ChatOllama(model=model, reasoning=think, client_kwargs={"timeout": CFG["timeout"]}, **common)
+    return GuardedChatOllama(model=model, reasoning=think, client_kwargs={"timeout": CFG["timeout"]}, **common)
 
 
 # ---------------------------------------------------------------------------------------------- tools
