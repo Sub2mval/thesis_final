@@ -95,14 +95,15 @@ class Recorder:
             log(f"      llm call #{c['call_index']} {c['call_type']:<11} {c['model']:<17} {c['elapsed_seconds']:6.1f}s  "
                 f"tokens in/out {c['prompt_tokens']}/{c['completion_tokens']}" + ("" if c["status"] == "ok" else f"  FAILED: {c['error']}"))
 
-    def stats(self, phase: str) -> dict:
-        calls = [c for c in self.calls if c["phase"] == phase]
+    def stats(self, phase: str, prior: list = ()) -> dict:
+        """Token / time stats of one phase; `prior` = calls of an earlier, interrupted attempt of the same phase (resumed runs)."""
+        calls = list(prior) + [{k: v for k, v in c.items() if k != "phase"} for c in self.calls if c["phase"] == phase]
         ok = [c for c in calls if c["status"] == "ok"]
         pt, ct = sum(c["prompt_tokens"] or 0 for c in ok), sum(c["completion_tokens"] or 0 for c in ok)
         return {"n_llm_calls": len(calls), "n_successful_calls": len(ok), "n_failed_attempts": len(calls) - len(ok),
                 "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct,
                 "total_elapsed_seconds": sum(c["elapsed_seconds"] for c in calls),
-                "calls": [{k: v for k, v in c.items() if k != "phase"} for c in calls]}
+                "calls": calls}
 
 
 def install_recorder(rec: Recorder, retries: int = 2) -> None:
@@ -131,7 +132,7 @@ def install_recorder(rec: Recorder, retries: int = 2) -> None:
         m = res.generations[0].message
         out = msg_dict(m)
         um = getattr(m, "usage_metadata", None) or {}
-        done = (getattr(m, "response_metadata", None) or {}).get("done_reason")  # "length" = cut off (context window full)
+        done = agents.done_reason(res)  # "length" = cut off (output cap or context window full)
         if done == "length":
             log(f"      !! {model} was cut off at the context limit (done_reason=length); consider a larger --num-ctx")
         rec.add(call_type=kind, provider="ollama", model=model, elapsed_seconds=time.time() - t0,
@@ -196,7 +197,11 @@ def _fence(text: Any) -> str:
 def render_md(title: str, r: dict, full: bool = False, prior: tuple = ()) -> str:
     """Public report; full=True adds every model call (`prior` = [(heading, calls)] of earlier phases, e.g. the shared ones)."""
     inj = r.get("injection") or {}
-    o = [f"# {title}" + (" - full trace" if full else ""), "",
+    o = [f"# {title}" + (" - full trace" if full else ""), ""]
+    if r.get("error"):
+        o += [f"> **RUN FAILED:** `{r['error']}`", ">",
+              "> Everything below is the partial trace up to the failure. Rerun the same command: only the failed part is repeated.", ""]
+    o += [
          f"**Task ID:** `{r['task_id']}`", f"**Condition:** `{r['condition']}`",
          f"**Trust allocator:** {'ON' if r['trust_allocator'] else 'OFF'}",
          f"**Agent models:** {r['agent_models']} | **Trust model:** {r['trust_model'] if r['trust_allocator'] else '-'}",
@@ -253,59 +258,138 @@ def summary_row(r: dict) -> dict:
             "ground_truth": r["ground_truth"], "answer": r["final_answer_extracted"], "correct": r["correct"], "error": r["error"] or ""}
 
 
+def write_summary(out_dir: Path) -> list[dict]:
+    """summary.csv rebuilt from every record on disk (so resumed / repeated runs never duplicate rows)."""
+    recs = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(out_dir.glob("*/*_o[nf]*.json"))]
+    rows = [summary_row(r) for r in recs if "condition" in r]
+    if rows:
+        with open(out_dir / "summary.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0]))
+            w.writeheader()
+            w.writerows(rows)
+    return rows
+
+
+def load_record(path: Path) -> Optional[dict]:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def finished(rec: Optional[dict]) -> bool:
+    """A record that needs no more work: no error and a final answer."""
+    return bool(rec) and not rec.get("error") and rec.get("final_answer_raw") is not None
+
+
 # --------------------------------------------------------------------------------------------------
-# One task: message 1 and its corruption are made ONCE; every condition then starts from them
+# One task. Everything is resumable, so a failure costs only the failed part on the next run:
+#   shared.json  message 1 and its corruption (written as soon as each exists, never regenerated)
+#   <cond>.json  finished conditions are skipped; a failed one is resumed from its LangGraph checkpoint (deterministic thread
+#                id in work_dir/gaia.db): the failed agent turn and what follows are redone, completed turns are not
 # --------------------------------------------------------------------------------------------------
-def run_task(task: dict, args: argparse.Namespace, rec: Recorder, out_dir: Path, work_dir: Path) -> list[dict]:
+def save_shared(path: Path, first: dict, inj: Optional[dict], calls: list, started: str) -> None:
+    from langchain_core.messages import messages_to_dict
+
+    ser = lambda f: f and {"text": f["text"], "hist": messages_to_dict(f["hist"])}
+    data = {"first": ser(first), "injection": inj and {k: v for k, v in inj.items() if k != "first"},
+            "bad_first": inj and ser(inj["first"]), "calls": calls, "started_at": started}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+def load_shared(path: Path) -> Optional[dict]:
+    from langchain_core.messages import messages_from_dict
+
+    d = load_record(path)
+    if not d or not d.get("first"):
+        return None
+    de = lambda f: f and {"text": f["text"], "hist": messages_from_dict(f["hist"])}
+    inj = d.get("injection") and {**d["injection"], "first": de(d.get("bad_first"))}
+    return {"first": de(d["first"]), "inj": inj, "calls": d.get("calls", []), "started_at": d.get("started_at")}
+
+
+def run_task(task: dict, args: argparse.Namespace, rec: Recorder, out_dir: Path, work_dir: Path) -> bool:
+    """-> False if any condition of this task is (still) failed. Raises agents.KeysExhausted after saving what exists."""
     from debate import build_graph, first_answer, run_debate
     from error_injection import make_injection
 
     settings = {"off": [False], "on": [True], "both": [False, True]}[args.trust]
-    task_dir = out_dir / task["task_id"]
-    todo = [t for t in settings if not (args.skip_existing and all((task_dir / f"{c}_{'on' if t else 'off'}.json").exists() for c in ("baseline", "fork")))]
+    task_dir, models, common = out_dir / task["task_id"], dict(zip("123", args.agent_models)), dict(task=task, args=args)
+    name = lambda kind, trust: f"{kind}_{'on' if trust else 'off'}"
+    old = {(k, t): None if args.fresh else load_record(task_dir / f"{name(k, t)}.json") for k in ("baseline", "fork") for t in settings}
+    todo = [t for t in settings if not all(finished(old[(k, t)]) for k in ("baseline", "fork"))]
     if not todo:
-        log("  skip: outputs already exist")
-        return []
-    models = dict(zip("123", args.agent_models))
-    common = dict(task=task, args=args)
+        log("  skip: all conditions already finished")
+        return True
+    salt = f"::fresh{int(time.time())}" if args.fresh else ""  # --fresh: new checkpoint threads, nothing resumed
     rec.reset()
-    rows: list[dict] = []
-    try:  # --- shared part: Agent 1's first answer + the one corruption of it
-        first = first_answer(models["1"], task["Question"], task["file"])
-        inj = make_injection(task["Question"], task["file"], first, args.injector_model)
+
+    # ---- shared part: message 1 and its corruption, saved as soon as each exists
+    sh = None if args.fresh else load_shared(task_dir / "shared.json")
+    prior_shared = (sh or {}).get("calls", [])
+    try:
+        first = sh["first"] if sh else first_answer(models["1"], task["Question"], task["file"])
+        if not sh:
+            save_shared(task_dir / "shared.json", first, None, rec.stats("shared")["calls"], rec.started["shared"])
+        inj = sh["inj"] if sh and sh["inj"] else make_injection(task["Question"], task["file"], first, args.injector_model)
+        if not (sh and sh["inj"]):
+            save_shared(task_dir / "shared.json", first, inj, rec.stats("shared", prior_shared)["calls"], (sh or {}).get("started_at") or rec.started["shared"])
+        log(f"  shared: message 1 {'reused' if sh and sh['inj'] else 'made'}; injection {inj['fm_id'] if inj['eligible'] else 'INELIGIBLE (no injected runs)'}")
+    except agents.KeysExhausted:
+        raise
     except Exception as e:
         log(f"  ERROR (shared part): {type(e).__name__}: {e}")
         traceback.print_exc()
-        r = build_record(state={}, condition="baseline_" + ("on" if todo[0] else "off"), trust=todo[0], thread_id="-", stats=rec.stats("shared"),
+        r = build_record(state={}, condition=name("baseline", todo[0]), trust=todo[0], thread_id="-", stats=rec.stats("shared", prior_shared),
                          started=rec.started["shared"], error=f"{type(e).__name__}: {e}", **common)
         write_outputs(task_dir, r["condition"], r)
-        return [summary_row(r)]
-    shared = [("SHARED: message 1 + error injection (identical in all 4 conditions)", rec.stats("shared")["calls"])]
-    log(f"  shared: message 1 made; injection {inj['fm_id'] if inj['eligible'] else 'INELIGIBLE (no injected runs)'}")
+        return False
+    shared = [("SHARED: message 1 + error injection (identical in all 4 conditions)", rec.stats("shared", prior_shared)["calls"])]
+
+    ok, exhausted = True, None
     for trust in todo:
-        on = "on" if trust else "off"
         graph = build_graph(models, args.trust_model if trust else None, str(work_dir / "gaia.db"))
-        thread = f"{task['task_id']}::{on}::{uuid.uuid4().hex[:8]}"
         recs = {}
         for kind, start in (("baseline", first), ("fork", inj["first"])):
-            phase, err, state = f"{'clean' if kind == 'baseline' else 'fork'}_{on}", None, {}
+            cond = name(kind, trust)
+            prev = old[(kind, trust)]
+            if finished(prev):  # done in an earlier run: reuse, only needed as context for the fork's md
+                recs[kind] = prev
+                continue
+            if exhausted:  # the keys ran out earlier in this task: leave this condition untouched, it resumes next run
+                ok = False
+                continue
+            tid, phase, err, state = f"{task['task_id']}::{cond}{salt}", cond, None, {}
+            prior_calls = ((prev or {}).get("token_stats") or {}).get("calls", [])  # work already spent by a failed attempt
             rec.begin(phase)
             if start is None:  # ineligible injection: the fork record repeats the clean run (flagged by injection.eligible)
-                state = recs["baseline"]["_state"]
+                r = {**recs["baseline"], "condition": cond, "injection": injection_record(inj),
+                     "error": recs["baseline"].get("error"), "token_stats": rec.stats(phase)}
+                r.pop("_state", None)
+                write_outputs(task_dir, cond, r, prior=shared)
+                recs[kind] = r
+                continue
             else:
                 try:
-                    _, state = run_debate(graph, task["Question"], task["file"], args.n_rounds, f"{thread}::{kind}", first=start)
-                except Exception as e:  # keep what finished and report the failure
+                    _, state = run_debate(graph, task["Question"], task["file"], args.n_rounds, tid, first=start)
+                except Exception as e:  # keep whatever was reached (checkpointed state) and report the failure
                     err = f"{type(e).__name__}: {e}"
-                    log(f"  ERROR {kind} trust={on}: {err}")
+                    exhausted = str(e) if isinstance(e, agents.KeysExhausted) else None
+                    log(f"  ERROR {cond}: {err}")
                     traceback.print_exc()
-            r = build_record(state=state, condition=f"{kind}_{on}", trust=trust, thread_id=f"{thread}::{kind}", stats=rec.stats(phase),
-                             started=rec.started[phase], injection=injection_record(inj) if kind == "fork" else None, error=err, **common)
-            write_outputs(task_dir, f"{kind}_{on}", r, prior=shared + ([("CLEAN RUN", recs["baseline"]["token_stats"]["calls"])] if kind == "fork" else []))
+                    state = graph.get_state({"configurable": {"thread_id": tid}}).values or {}
+            r = build_record(state=state, condition=cond, trust=trust, thread_id=tid, stats=rec.stats(phase, prior_calls),
+                             started=(prev or {}).get("started_at") or rec.started[phase],
+                             injection=injection_record(inj) if kind == "fork" else None, error=err, **common)
+            clean_calls = (recs.get("baseline") or {}).get("token_stats", {}).get("calls", [])
+            write_outputs(task_dir, cond, r, prior=shared + ([("CLEAN RUN", clean_calls)] if kind == "fork" else []))
             recs[kind] = {**r, "_state": state}
-            rows.append(summary_row(r))
-            log(f"  trust={on:3s} {kind:8s}: answer={r['final_answer_extracted']!r} correct={r['correct']}" + (f" ERROR={err}" if err else ""))
-    return rows
+            ok &= not err
+            log(f"  {cond:12s}: answer={r['final_answer_extracted']!r} correct={r['correct']}" + (f" ERROR={err}" if err else ""))
+    if exhausted:
+        raise agents.KeysExhausted(exhausted)
+    return ok
 
 
 # --------------------------------------------------------------------------------------------------
@@ -330,7 +414,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=42, help="seed for --n-questions sampling and Ollama sampling")
     p.add_argument("--output-dir", help="default: results/agents-<models>__trust-<model>")
     p.add_argument("--work-dir", default=str(HERE / ".gaia_work"), help="scratch dir for the sqlite checkpoints")
-    p.add_argument("--skip-existing", action="store_true", help="skip task/trust combos whose outputs already exist")
+    p.add_argument("--fresh", action="store_true", help="ignore earlier results and checkpoints and redo everything (default: resume - finished "
+                   "conditions are skipped and a failed one repeats only its failed part)")
+    p.add_argument("--max-output-tokens", type=int, default=12288, help="cap on tokens generated per model call (stops runaway thinking loops)")
+    p.add_argument("--max-key-wait", type=float, default=7200.0, help="longest a call waits for a rate-limited Ollama key to come back before the run stops "
+                   "cleanly (resume later with the same command)")
     p.add_argument("--quiet", action="store_true", help="do not print one line per LLM call")
     p.add_argument("--dotenv", default=str(HERE / ".env"))
     a = p.parse_args()
@@ -375,7 +463,7 @@ def main() -> int:
     if not agents.tavily_keys():
         raise SystemExit("TAVILY_API_KEY / TAVILY_API_KEY_1, _2, ... missing in .env (web search tool)")
     log(f"Tavily keys: {len(agents.tavily_keys())} (1000 searches each) | Ollama Cloud keys: {len(agents.numbered_keys('OLLAMA_API_KEY'))}")
-    agents.CFG.update(cloud=args.backend == "cloud", num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, timeout=args.llm_timeout or (60.0 if args.backend == "cloud" else 900.0))
+    agents.CFG.update(cloud=args.backend == "cloud", num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, max_tokens=args.max_output_tokens, max_key_wait=args.max_key_wait, timeout=args.llm_timeout or (60.0 if args.backend == "cloud" else 900.0))
     check_models(args)
     ensure_gaia(next((os.getenv(v) for v in ("HF_TOKEN", "HUGGINGFACE_TOKEN") if os.getenv(v)), None))  # no-op after the 1st run
     tasks = load_tasks()
@@ -400,19 +488,19 @@ def main() -> int:
         f"      tool {name}: {info}" if ev == "start" else f"        -> {name} done in {info}" if ev == "end" else f"      !! tool {name} ABANDONED after {info}")
     agents.NOTE_HOOK = lambda msg: log(f"      !! {msg}")
     install_recorder(rec, retries=0 if args.backend == "cloud" else 2)  # cloud: a failed call moves to the next key instead
-    rows: list[dict] = []
+    failed, stopped = 0, False
     for ti, tid in enumerate(ids, 1):
         log(f"=== Task {ti}/{len(ids)}: {tid} (level {tasks[tid]['Level']}) ===")
-        rows += run_task(tasks[tid], args, rec, out_dir, work_dir)
-    if rows:
-        csv_path, new = out_dir / "summary.csv", not (out_dir / "summary.csv").exists()
-        with open(csv_path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0]))
-            if new:
-                w.writeheader()
-            w.writerows(rows)
-        log(f"Done. Summary: {csv_path}. Analyse with: python analyze.py {out_dir.parent}")
-    return 1 if any(r["error"] for r in rows) else 0
+        try:
+            failed += not run_task(tasks[tid], args, rec, out_dir, work_dir)
+        except agents.KeysExhausted as e:
+            log(f"STOPPING: {e}")
+            stopped = True
+            break
+    rows = write_summary(out_dir)
+    log(f"{'Stopped early' if stopped else 'Done'}. {len(rows)} records, {sum(bool(x['error']) for x in rows)} failed. Summary: {out_dir / 'summary.csv'}. "
+        f"{'Rerun the same command to resume (only unfinished parts are repeated). ' if failed or stopped else ''}Analyse with: python analyze.py {out_dir.parent}")
+    return 2 if stopped else 1 if failed else 0
 
 
 if __name__ == "__main__":
