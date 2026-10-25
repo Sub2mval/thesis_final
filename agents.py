@@ -19,7 +19,8 @@ import ollama
 import requests
 from langchain.agents import create_agent
 from langchain.agents.middleware import ContextEditingMiddleware
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
 from langchain_experimental.tools import PythonREPLTool
 from langchain_ollama import ChatOllama
@@ -36,7 +37,9 @@ MAX_CHARS = 8_000  # one page of tool output (read_file pages through longer doc
 # Run-wide settings, overwritten from the CLI by the runner.
 # num_ctx matters: Ollama's default window is tiny and silently drops the oldest messages (question, system prompt).
 CFG = {"num_ctx": 32768, "think": True, "temperature": 0.0, "seed": 42, "timeout": 900.0, "cloud": True,
-       "max_tokens": 12288, "max_key_wait": 7200.0}
+       "max_tokens": 12288, "max_key_wait": 7200.0,
+       "max_steps": 10, "token_budget": 250_000}
+USAGE = {"tokens": 0, "lean": 0}  # tokens spent in the current phase (kept by the runner's recorder); agent turns taken in budget mode
 
 TOOL_TIMEOUT = 120.0  # seconds one tool call may take; Tavily, URL fetching and the Python shell have no timeout of their own
 NOTE_HOOK = None  # optional callable(message), set by the runner to log key rotations
@@ -71,6 +74,39 @@ def shrink(messages, cap: int = 20_000):
     return [fix(m) for m in messages]
 
 
+class Runaway(Exception):
+    """A streamed reply that ran away (endless repetition or far too long); the stream was cut off client-side."""
+
+
+def _watch(stream):
+    """Pass a streamed reply through, but abort it (closing the connection, so the server stops generating) as soon as it
+    is clearly a runaway: more than 3 characters per allowed output token, or one 200-character block repeating 6+ times in
+    the last 12000 characters. Needed because Ollama Cloud does not seem to honour num_predict: runaway thinking loops
+    ran to the server's own 65536-token limit (about 4 minutes and 65k tokens each)."""
+    total, since, tail = 0, 0, ""
+    try:
+        for part in stream:
+            seg = (getattr(part.message, "thinking", None) or "") + (part.message.content or "")
+            total, since, tail = total + len(seg), since + len(seg), (tail + seg)[-12000:]
+            if total > 3 * CFG["max_tokens"]:
+                raise Runaway(f"more than {3 * CFG['max_tokens']} characters of output")
+            if since >= 1000:
+                since = 0
+                if len(tail) >= 2400 and tail.count(tail[-200:]) >= 6:
+                    raise Runaway(f"endless repetition after {total} characters")
+            yield part
+    finally:
+        getattr(stream, "close", lambda: None)()
+
+
+class WatchedClient(ollama.Client):
+    """ollama.Client whose streamed chat replies go through _watch."""
+
+    def chat(self, *a, **kw):
+        stream = super().chat(*a, **kw)
+        return _watch(stream) if kw.get("stream") else stream
+
+
 def done_reason(res) -> str | None:
     """Why generation stopped ('stop' | 'length' | ...). Inside _generate it is in generation_info, not yet in response_metadata."""
     g = res.generations[0]
@@ -79,29 +115,36 @@ def done_reason(res) -> str | None:
 
 class GuardedChatOllama(ChatOllama):
     """ChatOllama that never lets a runaway generation or an oversized prompt wreck a run:
-    * a reply cut off at the output cap (done_reason=length: typically an endless repetition loop inside the thinking, which
-      once filled the whole context with 1M characters) is NOT used; it is regenerated with different sampling, and finally
-      without thinking. With temperature 0 and a fixed seed an identical retry would just loop again.
-    * a 400 'prompt is too long' is retried once with oversized messages cut down (shrink)."""
+    * a reply that runs away (Runaway) or is cut off at the output cap (done_reason=length) is NOT used; it is regenerated
+      with different sampling, then without thinking (an identical retry would loop again at temperature 0 with a fixed seed).
+      If all three attempts run away the reply is empty, and the caller's own fallbacks (forced answer, unusable audit) take over.
+    * a 400 'prompt is too long' is retried once with oversized messages cut down (shrink).
+    The key rotation of the cloud subclass sits INSIDE each attempt (_once), so a failed key never restarts the whole sequence."""
+
+    def _once(self, messages, *a, **kw):
+        return super()._generate(messages, *a, **kw)
 
     def _generate(self, messages, *a, **kw):
         def call(obj, msgs):
             try:
-                return super(GuardedChatOllama, obj)._generate(msgs, *a, **kw)
+                return obj._once(msgs, *a, **kw)
             except ollama.ResponseError as e:
                 if e.status_code != 400 or "too long" not in str(e).lower():
                     raise
                 NOTE_HOOK and NOTE_HOOK(f"prompt too long ({e}); retrying with oversized messages cut down")
-                return super(GuardedChatOllama, obj)._generate(shrink(msgs), *a, **kw)
+                return obj._once(shrink(msgs), *a, **kw)
 
-        res = call(self, messages)
-        for n, change in enumerate(({"temperature": 0.6}, {"temperature": 0.3, "reasoning": False}), 1):
-            if done_reason(res) != "length":
-                break
-            NOTE_HOOK and NOTE_HOOK(f"{self.model}: reply hit the output cap (runaway generation?); regenerating "
-                                    f"({'different sampling' if n == 1 else 'thinking off'}) instead of using it")
-            res = call(self.model_copy(update={**change, "seed": CFG["seed"] + n}), messages)
-        return res
+        res = None
+        for n, change in enumerate(({}, {"temperature": 0.6}, {"temperature": 0.3, "reasoning": False})):
+            try:
+                res = call(self if n == 0 else self.model_copy(update={**change, "seed": CFG["seed"] + n}), messages)
+                if done_reason(res) != "length":
+                    return res
+                why = "reply hit the output cap"
+            except Runaway as e:
+                res, why = None, f"runaway generation ({e})"
+            NOTE_HOOK and NOTE_HOOK(f"{self.model}: {why}; " + (f"regenerating ({'different sampling' if n == 0 else 'thinking off'}) instead of using it" if n < 2 else "giving up, empty reply"))
+        return res or ChatResult(generations=[ChatGeneration(message=AIMessage(content=""))])
 
 
 # ---- Ollama Cloud keys: round robin with per-key cooldowns ------------------------------------------------------------
@@ -126,7 +169,7 @@ def _cool_down(key: str, base: float) -> float:
     """Park a failed key for base * 2^(consecutive failures - 1) seconds (max 2 h); a success resets it. -> seconds."""
     with _lock:
         strikes = _cool.get(key, (0, 0))[1] + 1
-        secs = min(base * 2 ** (strikes - 1), 7200)
+        secs = min(base * 2 ** (strikes - 1), max(base, 7200))
         _cool[key] = (time.time() + secs, strikes)
         return secs
 
@@ -134,11 +177,11 @@ def _cool_down(key: str, base: float) -> float:
 class CloudChatOllama(GuardedChatOllama):
     """Guarded ChatOllama on Ollama Cloud, spread over several keys without 429 death spirals: every call goes to the next key
     that is not cooling down; a failing key is parked with a growing cooldown instead of being hammered again by every later
-    call (plan usage limit 15 min, other 429/529 20 s, bad key 24 h, stalled connection 30 s; each doubling per repeat, max 2 h).
-    When all keys are parked the call sleeps until the first is back; if that would exceed CFG max_key_wait it raises
-    KeysExhausted (the run stops cleanly and can be resumed)."""
+    call (monthly usage limit 6 h, plan usage limit 15 min, other 429/529 20 s, bad key 24 h, stalled connection 30 s; each
+    doubling per repeat, max 2 h except the monthly one). When all keys are parked the call sleeps until the first is back; if
+    that would exceed CFG max_key_wait it raises KeysExhausted (the run stops cleanly and can be resumed)."""
 
-    def _generate(self, messages, *a, **kw):
+    def _once(self, messages, *a, **kw):
         keys, waited = numbered_keys("OLLAMA_API_KEY"), 0.0
         while True:
             i, wait = _pick_key(keys)
@@ -150,15 +193,16 @@ class CloudChatOllama(GuardedChatOllama):
                 time.sleep(wait + 1)
                 waited += wait + 1
                 continue
-            self._client = ollama.Client(host=CLOUD_HOST, headers={"Authorization": f"Bearer {keys[i]}"}, timeout=CFG["timeout"])
+            self._client = WatchedClient(host=CLOUD_HOST, headers={"Authorization": f"Bearer {keys[i]}"}, timeout=CFG["timeout"])
             try:
-                res = super()._generate(messages, *a, **kw)
+                res = super()._once(messages, *a, **kw)
                 _cool.pop(keys[i], None)
                 return res
             except ollama.ResponseError as e:
                 if e.status_code not in SKIP_KEY_CODES:
                     raise
-                base = 86400 if e.status_code in (401, 403) else 900 if "usage limit" in str(e).lower() else 20
+                low = str(e).lower()
+                base = 86400 if e.status_code in (401, 403) else 21600 if "monthly" in low else 900 if "usage limit" in low else 20
                 why = f"HTTP {e.status_code}"
             except (httpx.TransportError, ConnectionError, TimeoutError) as e:
                 base, why = 30, f"{type(e).__name__} after up to {CFG['timeout']:g}s of silence"
@@ -174,17 +218,32 @@ def capabilities(model: str) -> tuple:
         return ()
 
 
-def make_llm(model: str, role: str) -> ChatOllama:
+def over_budget() -> bool:
+    """True once the current phase (one condition's run) has spent its token budget (CFG token_budget, 0 = unlimited)."""
+    return bool(CFG["token_budget"]) and USAGE["tokens"] >= CFG["token_budget"]
+
+
+def make_llm(model: str, role: str, think: bool | None = None) -> ChatOllama:
     """`role` (agent_call | trust_audit | corruption) goes into metadata so the trace recorder can label the call."""
     common = dict(temperature=CFG["temperature"], seed=CFG["seed"], num_ctx=CFG["num_ctx"], num_predict=CFG["max_tokens"], metadata={"role": role})
     if CFG["cloud"]:
-        return CloudChatOllama(model=CLOUD_MODELS[model], base_url=CLOUD_HOST, reasoning=CFG["think"], **common)
+        return CloudChatOllama(model=CLOUD_MODELS[model], base_url=CLOUD_HOST, reasoning=CFG["think"] if think is None else think, **common)
     caps = capabilities(model)
-    think = CFG["think"] and ("thinking" in caps or not caps)  # models without thinking support reject think=True
-    return GuardedChatOllama(model=model, reasoning=think, client_kwargs={"timeout": CFG["timeout"]}, **common)
+    think = (CFG["think"] if think is None else think) and ("thinking" in caps or not caps)  # models without thinking support reject think=True
+    llm = GuardedChatOllama(model=model, reasoning=think, client_kwargs={"timeout": CFG["timeout"]}, **common)
+    llm._client = WatchedClient(timeout=CFG["timeout"])  # host from OLLAMA_HOST, like the default client
+    return llm
 
 
 # ---------------------------------------------------------------------------------------------- tools
+_repeats: dict[tuple, int] = {}
+
+
+def reset_repeats() -> None:
+    """Forget which tool calls were made (called at the start of every agent turn)."""
+    _repeats.clear()
+
+
 def guarded(fn):
     """Tool wrapper: runs the call in a thread and gives up after TOOL_TIMEOUT s, returning an ERROR text the agent can react
     to (before, one hung search / download / `input()` / endless loop froze the whole run silently). An abandoned call is
@@ -193,6 +252,11 @@ def guarded(fn):
     def run(*a, **kw):
         res, stdout, t0 = {}, sys.stdout, time.time()
         arg = str((list(kw.values()) + list(a) or [""])[0]).replace("\n", " ")[:80]
+        key = (fn.__name__, str(a), str(sorted(kw.items())))
+        _repeats[key] = _repeats.get(key, 0) + 1
+        if _repeats[key] > 2:  # models sometimes repeat one identical call 15 times in a row: stop it at the third
+            return (f"ERROR: you already made this exact {fn.__name__} call {_repeats[key] - 1} times in this turn with the same result. "
+                    "Repeating it is pointless: use a different approach, or give your best FINAL ANSWER now.")
         TOOL_HOOK and TOOL_HOOK("start", fn.__name__, arg)
 
         def work():
@@ -259,27 +323,40 @@ def tavily_keys() -> list[str]:
     return numbered_keys("TAVILY_API_KEY")
 
 
+SEARCH_DEAD = "Tavily keys are exhausted or rejected"  # also the marker used to find results made without search
+
+
 @tool
 @guarded
 def web_search(query: str) -> str:
     """Search the web. Returns titles, URLs and snippets; open a promising page afterwards with read_file(url)."""
     global _key
-    keys = tavily_keys()
-    for _ in range(max(len(keys), 1)):
-        key = keys[_key % len(keys)] if keys else ""
-        try:  # plain REST call with a timeout (the langchain wrapper had none)
-            r = requests.post("https://api.tavily.com/search", json={"query": query, "max_results": 5},
-                              headers={"Authorization": f"Bearer {key}"}, timeout=30)
-        except requests.RequestException as e:  # a failed search must not crash the debate: the agent sees the error
-            return f"ERROR: web search failed: {type(e).__name__}: {e}"
-        if r.status_code in TAVILY_SKIP_CODES and len(keys) > 1:  # key exhausted / rejected -> next key
-            _key += 1
+    keys, codes = tavily_keys(), []
+    for attempt in range(2):
+        for _ in range(max(len(keys), 1)):
+            key = keys[_key % len(keys)] if keys else ""
+            try:  # plain REST call with a timeout (the langchain wrapper had none)
+                r = requests.post("https://api.tavily.com/search", json={"query": query, "max_results": 5},
+                                  headers={"Authorization": f"Bearer {key}"}, timeout=30)
+            except requests.RequestException as e:  # a failed search must not crash the debate: the agent sees the error
+                return f"ERROR: web search failed: {type(e).__name__}: {e}"
+            if r.status_code in TAVILY_SKIP_CODES:  # key exhausted / rejected / rate limited -> next key
+                codes.append(r.status_code)
+                _key += 1
+                continue
+            if r.status_code != 200:
+                return f"ERROR: web search failed: HTTP {r.status_code} {r.text[:200]}"
+            hits = r.json().get("results") or []
+            return ("\n\n".join(f"{h['title']} ({h['url']})\n{h['content']}" for h in hits) or "(no results)")[:MAX_CHARS]
+        if attempt == 0 and codes and set(codes) == {429}:  # only rate limits: wait a moment, go round once more
+            time.sleep(5)
+            codes = []
             continue
-        if r.status_code != 200:
-            return f"ERROR: web search failed: HTTP {r.status_code} {r.text[:200]}"
-        hits = r.json().get("results") or []
-        return ("\n\n".join(f"{h['title']} ({h['url']})\n{h['content']}" for h in hits) or "(no results)")[:MAX_CHARS]
-    return f"ERROR: web search failed: all {len(keys)} Tavily keys are exhausted or rejected"
+        break
+    # Every key failed. Do NOT hand the agent an error to work around (everything after this would be answered without web
+    # access and silently corrupt the experiment): stop the run; it resumes from the checkpoint once keys are available.
+    raise KeysExhausted(f"all {len(keys)} {SEARCH_DEAD} (HTTP {sorted(set(codes)) or 'no key'}); add Tavily keys or wait for the "
+                        "quota reset, then rerun the same command (unfinished work resumes)")
 
 
 SYSTEM = """You are a careful research assistant solving a GAIA benchmark question, possibly as one member of a team that debates the answer.
@@ -287,7 +364,7 @@ Work in several steps: plan, call tools, read their results, and keep going unti
 - web_search(query): find facts; then open a page with read_file(url).
 - read_file(path_or_url, offset=0): read an attachment (pdf, docx, xlsx, pptx, csv, json, zip, html...) or a web page as markdown, one page at a time; long documents continue at the offset the page names.
 - Python_REPL: run Python for any calculation or data processing (state persists between calls; always print() what you want to see). Never do arithmetic in your head.
-You have roughly 15 tool calls per turn: stop researching and answer before they run out. Older tool outputs are shortened to a preview to save space, so write down the facts you need as you find them. If a tool returns an error, fix the call or try another approach.
+You have at most {STEPS} tool calls per turn: stop researching and answer before they run out. Older tool outputs are shortened to a preview to save space, so write down the facts you need as you find them. If a tool returns an error, fix the call or try another approach.
 Finish with a concise, auditable explanation (key evidence and calculations) and a last line `FINAL ANSWER: ...`, where the answer is a number (no units or commas unless asked), a few words, or a comma-separated list."""
 
 
@@ -328,5 +405,5 @@ def make_agent(model: str):
     """A LangGraph ReAct agent: the model may call tools repeatedly (multi-step) before it answers.
     Tool outputs are what fills the context window (Ollama then truncates silently or cuts generation mid-answer), so the
     newest ones get ~1.2 characters per context token (about a third of the window) and older ones are masked."""
-    return create_agent(make_llm(model, "agent_call"), [web_search, read_file, python_tool()], system_prompt=SYSTEM,
+    return create_agent(make_llm(model, "agent_call"), [web_search, read_file, python_tool()], system_prompt=SYSTEM.replace("{STEPS}", str(CFG["max_steps"])),
                         middleware=[ContextEditingMiddleware(edits=[MaskOldObservations(budget=int(CFG["num_ctx"] * 1.2))])])
