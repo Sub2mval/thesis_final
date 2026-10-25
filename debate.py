@@ -20,13 +20,14 @@ import uuid
 from typing import Annotated, TypedDict
 
 from langchain_core.exceptions import OutputParserException
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, convert_to_messages
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from pydantic import BaseModel, Field, ValidationError
 
-from agents import CFG, MaskOldObservations, make_agent, make_llm
+import agents
+from agents import CFG, MaskOldObservations, make_agent, make_llm, reset_repeats
 from Gricean_check import (GRICEAN_METRICS, attachment_blocks, format_combined_reason, format_conversation,
                            format_gricean_check_prompt, trust_score)
 
@@ -46,15 +47,31 @@ FORCE_ANSWER = ("You ran out of room or steps before giving an answer. Using onl
                 "concise answer now, ending with `FINAL ANSWER: ...`. Do not call tools.")
 
 
+BUDGET_ANSWER = ("The token budget for this question is used up. Using only what you have already found (and your best judgement "
+                 "for the rest), give your best concise answer now, ending with `FINAL ANSWER: ...`. Do not call tools.")
+
+
+def lean_answer(model: str, messages: list) -> list:
+    """Over the token budget: ONE tool-free, thinking-free call that answers from what is already known."""
+    agents.USAGE["lean"] += 1
+    msgs = convert_to_messages(messages)  # (the first user turn arrives as a dict)
+    reply = make_llm(model, "agent_call", think=False).invoke(msgs + [HumanMessage(content=BUDGET_ANSWER)])
+    return msgs + [reply]
+
+
 def run_agent(model: str, messages: list) -> list:
     """Run the tool-using agent. If it ends without a `FINAL ANSWER:` (generation cut off, step limit, format slip),
     ask once more for a best-effort answer, so a message is never empty because of infrastructure limits."""
+    if agents.over_budget():  # a decent answer from what is known beats unlimited tokens
+        return lean_answer(model, messages)
+
     def run(m):
-        """One agent run, at most ~20 tool steps. Streams the state so that, if the step limit is hit, the work done so far
+        """One agent run, at most CFG max_steps tool steps. Streams the state so that, if the step limit is hit, the work done so far
         is kept (it used to be lost, and the whole condition failed with GraphRecursionError)."""
         out = m
+        reset_repeats()
         try:
-            for chunk in make_agent(model).stream({"messages": m}, {"recursion_limit": 40}, stream_mode="values"):
+            for chunk in make_agent(model).stream({"messages": m}, {"recursion_limit": 2 * CFG["max_steps"] + 4}, stream_mode="values"):
                 out = chunk["messages"]
         except GraphRecursionError:
             out = list(out)
