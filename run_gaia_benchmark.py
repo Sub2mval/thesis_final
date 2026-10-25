@@ -84,13 +84,17 @@ class Recorder:
         self.phase, self.started = "shared", {}
         self.begin("shared")
 
-    def begin(self, phase: str) -> None:
+    def begin(self, phase: str, spent: int = 0) -> None:
+        """Start a phase; `spent` = tokens an earlier, interrupted attempt of it already used (counts towards the budget)."""
         self.phase, self.started[phase] = phase, now_iso()
+        agents.USAGE.update(tokens=spent, lean=0)
 
     def add(self, **kw: Any) -> None:
         with self.lock:
             self.calls.append({"call_index": len(self.calls) + 1, "phase": self.phase, **kw})
             c = self.calls[-1]
+            if c["status"] == "ok":
+                agents.USAGE["tokens"] += (c["prompt_tokens"] or 0) + (c["completion_tokens"] or 0)
         if self.verbose:
             log(f"      llm call #{c['call_index']} {c['call_type']:<11} {c['model']:<17} {c['elapsed_seconds']:6.1f}s  "
                 f"tokens in/out {c['prompt_tokens']}/{c['completion_tokens']}" + ("" if c["status"] == "ok" else f"  FAILED: {c['error']}"))
@@ -103,6 +107,7 @@ class Recorder:
         return {"n_llm_calls": len(calls), "n_successful_calls": len(ok), "n_failed_attempts": len(calls) - len(ok),
                 "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct,
                 "total_elapsed_seconds": sum(c["elapsed_seconds"] for c in calls),
+                "budget_lean_turns": agents.USAGE["lean"],  # agent turns answered in cheap budget mode (token budget used up)
                 "calls": calls}
 
 
@@ -134,7 +139,7 @@ def install_recorder(rec: Recorder, retries: int = 2) -> None:
         um = getattr(m, "usage_metadata", None) or {}
         done = agents.done_reason(res)  # "length" = cut off (output cap or context window full)
         if done == "length":
-            log(f"      !! {model} was cut off at the context limit (done_reason=length); consider a larger --num-ctx")
+            log(f"      !! {model} reply cut off (done_reason=length: output cap or context window full)")
         rec.add(call_type=kind, provider="ollama", model=model, elapsed_seconds=time.time() - t0,
                 prompt_tokens=um.get("input_tokens"), completion_tokens=um.get("output_tokens"), status="ok", error=None,
                 input=inp, output=out, reasoning=out.get("reasoning"), done_reason=done)
@@ -241,6 +246,8 @@ def render_md(title: str, r: dict, full: bool = False, prior: tuple = ()) -> str
           f"- LLM calls: {s['n_llm_calls']} ({s['n_failed_attempts']} failed attempts)",
           f"- Tokens: {s['prompt_tokens']} prompt + {s['completion_tokens']} completion = {s['total_tokens']}",
           f"- LLM time: {s['total_elapsed_seconds']:.1f}s"]
+    if s.get("budget_lean_turns"):
+        o += [f"- **Token budget used up:** {s['budget_lean_turns']} agent turn(s) were answered in cheap mode (no tools, no thinking)"]
     return "\n".join(o) + "\n"
 
 
@@ -317,16 +324,20 @@ def run_task(task: dict, args: argparse.Namespace, rec: Recorder, out_dir: Path,
     settings = {"off": [False], "on": [True], "both": [False, True]}[args.trust]
     task_dir, models, common = out_dir / task["task_id"], dict(zip("123", args.agent_models)), dict(task=task, args=args)
     name = lambda kind, trust: f"{kind}_{'on' if trust else 'off'}"
-    old = {(k, t): None if args.fresh else load_record(task_dir / f"{name(k, t)}.json") for k in ("baseline", "fork") for t in settings}
+    poisoned = any(agents.SEARCH_DEAD in p.read_text(encoding="utf-8", errors="ignore") for p in task_dir.glob("*.json"))
+    fresh = args.fresh or poisoned
+    if poisoned and not args.fresh:
+        log("  earlier results of this task were made while web search was dead (every search failed): redoing the whole task")
+    old = {(k, t): None if fresh else load_record(task_dir / f"{name(k, t)}.json") for k in ("baseline", "fork") for t in settings}
     todo = [t for t in settings if not all(finished(old[(k, t)]) for k in ("baseline", "fork"))]
     if not todo:
         log("  skip: all conditions already finished")
         return True
-    salt = f"::fresh{int(time.time())}" if args.fresh else ""  # --fresh: new checkpoint threads, nothing resumed
+    salt = f"::fresh{int(time.time())}" if fresh else ""  # --fresh: new checkpoint threads, nothing resumed
     rec.reset()
 
     # ---- shared part: message 1 and its corruption, saved as soon as each exists
-    sh = None if args.fresh else load_shared(task_dir / "shared.json")
+    sh = None if fresh else load_shared(task_dir / "shared.json")
     prior_shared = (sh or {}).get("calls", [])
     try:
         first = sh["first"] if sh else first_answer(models["1"], task["Question"], task["file"])
@@ -362,7 +373,7 @@ def run_task(task: dict, args: argparse.Namespace, rec: Recorder, out_dir: Path,
                 continue
             tid, phase, err, state = f"{task['task_id']}::{cond}{salt}", cond, None, {}
             prior_calls = ((prev or {}).get("token_stats") or {}).get("calls", [])  # work already spent by a failed attempt
-            rec.begin(phase)
+            rec.begin(phase, spent=sum((c["prompt_tokens"] or 0) + (c["completion_tokens"] or 0) for c in prior_calls if c["status"] == "ok"))
             if start is None:  # ineligible injection: the fork record repeats the clean run (flagged by injection.eligible)
                 r = {**recs["baseline"], "condition": cond, "injection": injection_record(inj),
                      "error": recs["baseline"].get("error"), "token_stats": rec.stats(phase)}
@@ -416,6 +427,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--work-dir", default=str(HERE / ".gaia_work"), help="scratch dir for the sqlite checkpoints")
     p.add_argument("--fresh", action="store_true", help="ignore earlier results and checkpoints and redo everything (default: resume - finished "
                    "conditions are skipped and a failed one repeats only its failed part)")
+    p.add_argument("--skip-existing", action="store_true", help=argparse.SUPPRESS)  # old flag, now the default behaviour (no-op)
+    p.add_argument("--token-budget", type=int, default=250_000, help="tokens (prompt + completion) one condition's run may spend before its remaining agent "
+                   "turns are answered cheaply from what is known (no tools, no thinking); 0 = unlimited. Typical questions stay well below")
+    p.add_argument("--max-tool-steps", type=int, default=10, help="tool calls an agent may make per turn (default 10)")
     p.add_argument("--max-output-tokens", type=int, default=12288, help="cap on tokens generated per model call (stops runaway thinking loops)")
     p.add_argument("--max-key-wait", type=float, default=7200.0, help="longest a call waits for a rate-limited Ollama key to come back before the run stops "
                    "cleanly (resume later with the same command)")
@@ -463,7 +478,7 @@ def main() -> int:
     if not agents.tavily_keys():
         raise SystemExit("TAVILY_API_KEY / TAVILY_API_KEY_1, _2, ... missing in .env (web search tool)")
     log(f"Tavily keys: {len(agents.tavily_keys())} (1000 searches each) | Ollama Cloud keys: {len(agents.numbered_keys('OLLAMA_API_KEY'))}")
-    agents.CFG.update(cloud=args.backend == "cloud", num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, max_tokens=args.max_output_tokens, max_key_wait=args.max_key_wait, timeout=args.llm_timeout or (60.0 if args.backend == "cloud" else 900.0))
+    agents.CFG.update(cloud=args.backend == "cloud", num_ctx=args.num_ctx, think=not args.no_think, temperature=args.temperature, seed=args.seed, max_tokens=args.max_output_tokens, token_budget=args.token_budget, max_steps=args.max_tool_steps, max_key_wait=args.max_key_wait, timeout=args.llm_timeout or (60.0 if args.backend == "cloud" else 900.0))
     check_models(args)
     ensure_gaia(next((os.getenv(v) for v in ("HF_TOKEN", "HUGGINGFACE_TOKEN") if os.getenv(v)), None))  # no-op after the 1st run
     tasks = load_tasks()
