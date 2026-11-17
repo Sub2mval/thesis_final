@@ -10,4 +10,5 @@ huggingface_hub
 ollama
 pandas
 scipy
+matplotlib
 pyarrow        # only if the GAIA metadata is read as parquet
